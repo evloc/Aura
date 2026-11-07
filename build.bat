@@ -44,7 +44,7 @@ echo  Installing what AURA needs (first time takes a minute)...
 
 echo.
 echo  Building...
-"%VPY%" -m PyInstaller --noconfirm --clean --onefile ^
+"%VPY%" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
   --name AURA --icon icon.ico ^
   --add-data "templates;templates" ^
   --add-data "version.json;." ^
@@ -70,7 +70,8 @@ if exist "%ISCC%" (
 
 echo.
 echo  Checking the new exe...
-"AURA.exe" --selftest
+start "" /wait "AURA.exe" --selftest
+type "%APPDATA%\Unreleased\selftest.txt"
 echo.
 echo  ================================
 echo   Done!  AURA.exe is in this folder:

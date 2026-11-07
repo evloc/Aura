@@ -33,6 +33,13 @@ from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
 
+# The Windows exe is built without a console window. Then there is nowhere for
+# output to go, and some libraries fail on a missing stdout/stderr — give them one.
+if sys.stdout is None or sys.stderr is None:
+    _devnull = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stdout or _devnull
+    sys.stderr = sys.stderr or _devnull
+
 from flask import Flask, Response, abort, jsonify, request, send_file
 
 try:
@@ -2147,17 +2154,41 @@ def _download_and_install(url, size):
         if dest.stat().st_size < 100_000:
             raise OSError("the download looks incomplete")
         UPDATE["state"] = "installing"
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        # The new AURA is started by the installer, a grandchild of this one. Without a
-        # clean environment it inherits this copy's PyInstaller settings, tries to run
-        # from this copy's temp folder (deleted as we exit) and never opens.
+        # A clean environment for everything started from here: otherwise the new AURA
+        # inherits this copy's PyInstaller settings, tries to run from this copy's temp
+        # folder (deleted as we exit) and never opens.
         env = {k: v for k, v in os.environ.items()
-               if not (k.startswith("_PYI") or k.startswith("_MEI") or k == "TCL_LIBRARY" or k == "TK_LIBRARY")}
+               if not (k.startswith("_PYI") or k.startswith("_MEI") or k in ("TCL_LIBRARY", "TK_LIBRARY"))}
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         log = Path(tempfile.gettempdir()) / "AURA-update.log"
-        subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS",
-                          "/LOG=%s" % log], close_fds=True, creationflags=flags, env=env,
-                         cwd=tempfile.gettempdir())
+        # Reopen the installed copy (a stand-alone AURA.exe in Downloads isn't the one updated).
+        exe = str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "AURA" / "AURA.exe")
+        if FROZEN and (Path(sys.executable).parent / "unins000.exe").exists():
+            exe = sys.executable
+        q = lambda x: "'" + str(x).replace("'", "''") + "'"
+        # A small hidden PowerShell helper runs the installer, waits for it to finish,
+        # then starts the updated AURA — so reopening doesn't depend on the installer.
+        script = (
+            "$ErrorActionPreference='Continue';"
+            "Start-Sleep -Milliseconds 1500;"
+            "$p=Start-Process -FilePath %s -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"
+            "'/CLOSEAPPLICATIONS',%s) -PassThru;"
+            "$p.WaitForExit();"
+            "Add-Content -LiteralPath %s -Value ('installer finished: ' + $p.ExitCode);"
+            "Start-Sleep -Seconds 1;"
+            "Start-Process -FilePath %s;"
+            "Add-Content -LiteralPath %s -Value 'started AURA'"
+        ) % (q(dest), q('/LOG="%s"' % log), q(str(log) + ".txt"), q(exe), q(str(log) + ".txt"))
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-WindowStyle", "Hidden", "-Command", script],
+                             close_fds=True, creationflags=no_window, env=env, cwd=tempfile.gettempdir())
+        except OSError:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS",
+                              "/LOG=%s" % log], close_fds=True, creationflags=flags, env=env,
+                             cwd=tempfile.gettempdir())
         threading.Timer(1.5, lambda: os._exit(0)).start()
     except Exception as exc:
         UPDATE.update(state="error", error=str(exc))

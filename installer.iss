@@ -45,5 +45,6 @@ Name: "{autoprograms}\AURA"; Filename: "{app}\AURA.exe"
 Name: "{autodesktop}\AURA"; Filename: "{app}\AURA.exe"; Tasks: desktopicon
 
 [Run]
-; Runs after a normal install and after a silent self-update, so AURA reopens.
-Filename: "{app}\AURA.exe"; Description: "Open AURA"; Flags: nowait postinstall
+; Opens AURA after a normal install. A self-update (silent) is reopened by AURA's
+; own update helper instead, so this is skipped then.
+Filename: "{app}\AURA.exe"; Description: "Open AURA"; Flags: nowait postinstall skipifsilent

@@ -20,7 +20,7 @@ Folder layout (the page must sit in `templates/`):
 Windows (or Linux + Wine), Python 3.12:
 
     pip install -r requirements.txt pyinstaller
-    pyinstaller --noconfirm --clean --onefile ^
+    pyinstaller --noconfirm --clean --onefile --noconsole ^
       --name AURA --icon icon.ico ^
       --add-data "templates;templates" ^
       --add-data "version.json;." ^
@@ -46,4 +46,7 @@ Gotchas, learned the hard way:
   not bundled and download on first use.
 - `--collect-all av` brings the audio decoder/MP3 encoder used by *Convert to MP3*
   (the self-test prints an `mp3 converter` line).
+- `--noconsole` hides the black terminal window. AURA quits by itself about a
+  minute after its window closes. The self-test then prints nothing on screen;
+  read `%APPDATA%\Unreleased\selftest.txt` (build.bat shows it for you).
 - To run from source instead: `python app.py`.

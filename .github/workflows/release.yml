@@ -39,7 +39,7 @@ jobs:
 
       - name: Build AURA.exe
         run: >
-          pyinstaller --noconfirm --clean --onefile
+          pyinstaller --noconfirm --clean --onefile --noconsole
           --name AURA --icon icon.ico
           --add-data "templates;templates"
           --add-data "version.json;."
@@ -51,7 +51,12 @@ jobs:
           app.py
 
       - name: Self-test the exe
-        run: dist\AURA.exe --selftest
+        shell: pwsh
+        run: |
+          # AURA.exe has no console window, so wait for it and read its report
+          $p = Start-Process -FilePath "dist\AURA.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:APPDATA\Unreleased\selftest.txt"
+          if ($p.ExitCode -ne 0) { exit 1 }
 
       - name: Build the installer
         shell: pwsh
