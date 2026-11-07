@@ -2824,11 +2824,18 @@ async function installUpdate(){
   try{await post('/api/app/update/install');}catch(e){toast(e.message,true);return;}
   $('#updBar').style.display='block';$('#btnUpdGo').disabled=true;$('#btnUpd').disabled=true;
   const t=setInterval(async()=>{
-    let s;try{s=await api('/api/app/update/status');}catch(e){$('#updStat').textContent='Installing — AURA will reopen in a moment…';clearInterval(t);return;}
+    let s;try{s=await api('/api/app/update/status');}catch(e){clearInterval(t);updGone();return;}
     if(s.state==='downloading'){const p=s.total?Math.round(100*s.done/s.total):0;$('#updBar i').style.width=p+'%';$('#updStat').textContent='Downloading the update… '+p+'%';}
     else if(s.state==='installing'){$('#updBar i').style.width='100%';$('#updStat').textContent='Installing — AURA will reopen in a moment…';}
     else if(s.state==='error'){clearInterval(t);$('#updStat').textContent='Update failed: '+s.error;$('#updStat').className='dstat bad';$('#btnUpdGo').disabled=false;$('#btnUpd').disabled=false;}
   },500);
+}
+function updGone(){
+  // this copy has closed for the update; the new one opens in its own window
+  const w=el('div','modal','<div class="box" style="max-width:420px;padding:26px;text-align:center"><div style="font-size:17px;font-weight:700;margin-bottom:8px">Updating AURA…</div>'+
+    '<div class="count" style="line-height:1.6">The new version opens in its own window in a few seconds. This window can be closed.</div></div>');
+  w.style.zIndex=999;document.body.appendChild(w);try{audio.pause();}catch(e){}
+  setTimeout(()=>{try{window.close();}catch(e){}},6000);
 }
 $('#btnUpdGo').onclick=installUpdate;
 

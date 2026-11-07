@@ -2148,8 +2148,16 @@ def _download_and_install(url, size):
             raise OSError("the download looks incomplete")
         UPDATE["state"] = "installing"
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
-                         close_fds=True, creationflags=flags)
+        # The new AURA is started by the installer, a grandchild of this one. Without a
+        # clean environment it inherits this copy's PyInstaller settings, tries to run
+        # from this copy's temp folder (deleted as we exit) and never opens.
+        env = {k: v for k, v in os.environ.items()
+               if not (k.startswith("_PYI") or k.startswith("_MEI") or k == "TCL_LIBRARY" or k == "TK_LIBRARY")}
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        log = Path(tempfile.gettempdir()) / "AURA-update.log"
+        subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS",
+                          "/LOG=%s" % log], close_fds=True, creationflags=flags, env=env,
+                         cwd=tempfile.gettempdir())
         threading.Timer(1.5, lambda: os._exit(0)).start()
     except Exception as exc:
         UPDATE.update(state="error", error=str(exc))
