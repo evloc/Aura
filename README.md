@@ -245,6 +245,18 @@ with, then **Write tags**.
 
 ---
 
+## Convert to MP3
+
+Settings → **Convert to MP3** shows how many songs aren't MP3 yet (WAV, FLAC,
+M4A, OGG, OPUS, WMA, AIFF) and converts them all; or in **Library** search
+`notmp3`, tick the songs you want and press **Convert to MP3…**. Pick the
+quality (320 kbps is the default) and what happens to the originals:
+- **Move into an `_originals` folder** (default) — the folder sits in your
+  music folder, AURA never scans it, and nothing is deleted.
+- **Leave them where they are** — you keep both copies.
+Title, artist, album, cover art, rating and lyrics (timed ones too) are copied
+into the MP3, and favorites, playlists, play counts and versions move to it.
+
 ## Undo
 
 Every bulk write is snapshotted before it happens — auto-fill, bulk edits, and

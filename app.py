@@ -705,9 +705,9 @@ def iter_audio_files(folders, skip_dirs=()):
                 dirnames[:] = []
                 continue
             dirnames[:] = [d for d in dirnames if not d.startswith(".")
-                           and d.lower() not in {"node_modules", "_duplicates"}]
+                           and d.lower() not in {"node_modules", "_duplicates", "_originals"}]
             for name in filenames:
-                if Path(name).suffix.lower() in AUDIO_EXT:
+                if Path(name).suffix.lower() in AUDIO_EXT and not name.endswith(".converting.mp3"):
                     p = str(Path(dirpath) / name)
                     key = os.path.normcase(p)
                     if key not in seen:
@@ -2164,6 +2164,152 @@ def _download_and_install(url, size):
 
 
 # --------------------------------------------------------------------------
+# convert to MP3 — WAV, FLAC, M4A, OGG… become MP3s with tags, cover and lyrics
+# --------------------------------------------------------------------------
+
+CONV = {"lock": threading.Lock(), "jobs": [], "running": False, "cancel": False}
+MP3_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+
+
+def encode_mp3(src, dest, kbps=320, progress=None):
+    """Decode any audio file and encode it as MP3 (LAME through PyAV)."""
+    import av
+    with av.open(src) as inp:
+        stream = next((st for st in inp.streams if st.type == "audio"), None)
+        if stream is None:
+            raise OSError("no audio in this file")
+        dur = float(inp.duration / 1e6) if inp.duration else 0.0
+        rate = stream.rate or 44100
+        if rate not in MP3_RATES:
+            rate = 44100 if rate % 11025 == 0 else 48000
+        layout = "mono" if (stream.channels or 2) == 1 else "stereo"
+        with av.open(dest, "w", format="mp3") as out:
+            o = out.add_stream("libmp3lame", rate=rate)
+            o.bit_rate = int(kbps) * 1000
+            try:
+                o.layout = layout
+            except Exception:
+                pass
+            res = av.AudioResampler(format="fltp", layout=layout, rate=rate)
+            for frame in inp.decode(stream):
+                for rf in res.resample(frame):
+                    for pkt in o.encode(rf):
+                        out.mux(pkt)
+                if progress and dur and frame.time is not None:
+                    progress(min(0.99, frame.time / dur))
+            for rf in res.resample(None):
+                for pkt in o.encode(rf):
+                    out.mux(pkt)
+            for pkt in o.encode(None):
+                out.mux(pkt)
+
+
+def originals_dir(src):
+    """_originals inside the music folder the song lives in."""
+    cfg = load_config()
+    src_n = os.path.normcase(os.path.abspath(src))
+    for f in cfg.get("folders") or []:
+        fn = os.path.normcase(os.path.abspath(f))
+        if src_n.startswith(fn + os.sep):
+            return Path(f) / "_originals"
+    return Path(src).parent / "_originals"
+
+
+def _copy_metadata(row, src, dest):
+    data = {k: row[k] or "" for k in TAG_FIELDS if k in row.keys()}
+    data["rating"] = row["rating"] or 0
+    write_tags(dest, data)
+    art, mime = get_artwork(src)
+    if art:
+        set_artwork(dest, art, mime)
+    lf = read_lyrics_full(src)
+    if lf["plain"] or lf["synced"]:
+        write_lyrics(dest, lf["plain"] or "\n".join(t for _, t in lf["synced"]), lf["synced"] or None)
+
+
+def convert_one(job, kbps, originals):
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (job["track_id"],)).fetchone()
+        if not row or not os.path.exists(row["path"]):
+            raise OSError("the file is missing")
+        src = row["path"]
+        if src.lower().endswith(".mp3"):
+            job.update(state="skipped", note="already an MP3")
+            return
+        dest = Path(src).with_suffix(".mp3")
+        if dest.exists():
+            job.update(state="skipped", note="%s already exists" % dest.name)
+            return
+        tmp = dest.with_name(dest.stem + ".converting.mp3")
+        try:
+            encode_mp3(src, str(tmp), kbps, progress=lambda f: job.__setitem__("progress", round(f, 3)))
+            if CONV["cancel"]:
+                raise InterruptedError()
+            _copy_metadata(row, src, str(tmp))
+            os.replace(tmp, dest)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        moved = ""
+        if originals == "move":
+            od = originals_dir(src)
+            od.mkdir(parents=True, exist_ok=True)
+            target = od / Path(src).name
+            n = 2
+            while target.exists():
+                target = od / ("%s (%d)%s" % (Path(src).stem, n, Path(src).suffix))
+                n += 1
+            shutil.move(src, str(target))
+            moved = str(target)
+        # The song keeps its place in the library: same id, so favorites,
+        # playlists, play counts, versions and stats all carry over to the MP3.
+        new = analyse(str(dest), False)
+        for k in ("_rating", "_notes", "_user_tags", "gain_db"):
+            new.pop(k, None)
+        new["fingerprint"] = row["fingerprint"]
+        new["last_scan"] = time.time()
+        if originals == "move":
+            cols = ", ".join("%s=?" % k for k in new)
+            conn.execute("UPDATE tracks SET %s WHERE id=?" % cols, (*new.values(), row["id"]))
+        else:
+            # keep the original as its own entry; the MP3 joins as a new one
+            new.update(rating=row["rating"] or 0, notes=row["notes"] or "", user_tags=row["user_tags"] or "",
+                       first_seen=time.time())
+            conn.execute("INSERT OR IGNORE INTO tracks (%s) VALUES (%s)" % (", ".join(new), ", ".join("?" for _ in new)),
+                         tuple(new.values()))
+        conn.commit()
+        job.update(state="done", progress=1.0, mp3=str(dest), original=moved,
+                   saved=max(0, (row["size"] or 0) - (os.path.getsize(dest) or 0)))
+    except InterruptedError:
+        job.update(state="cancelled")
+    except Exception as exc:
+        job.update(state="error", note=str(exc) or type(exc).__name__)
+    finally:
+        conn.close()
+
+
+def _convert_worker(kbps, originals):
+    try:
+        todo = [j for j in CONV["jobs"] if j["state"] == "queued"]
+        workers = max(1, min(3, (os.cpu_count() or 2) // 2))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            def run(j):
+                if CONV["cancel"]:
+                    j["state"] = "cancelled"
+                    return
+                j["state"] = "running"
+                convert_one(j, kbps, originals)
+            list(ex.map(run, todo))
+    finally:
+        CONV["running"] = False
+        WATCH["sig"] = None      # don't treat our own new files as a reason to rescan
+
+
+# --------------------------------------------------------------------------
 # folder watcher — rescan when music is added, changed or removed
 # --------------------------------------------------------------------------
 
@@ -2195,6 +2341,8 @@ def folder_watcher(interval=20):
             sig = folder_signature(cfg)
             if WATCH["sig"] is None:
                 WATCH["sig"] = sig
+                continue
+            if CONV["running"]:
                 continue
             if sig != WATCH["sig"] and not SCAN_STATE["running"]:
                 if scan_library(deep=bool(cfg.get("fingerprint", True)), auto=True):
@@ -2256,6 +2404,8 @@ def match_query(row, q):
             ok = bool(row.get("has_art"))
         elif low == "untagged":
             ok = not (row.get("title") and row.get("artist"))
+        elif low in ("notmp3", "nonmp3", "convertible"):
+            ok = (row.get("ext") or "").lower() != "mp3"
         elif low == "unrated":
             ok = not row.get("rating")
         elif low == "versioned":
@@ -3325,6 +3475,53 @@ def api_app_update():
         return jsonify({"available": False, "error": "Couldn't check for updates — are you online?"}), 200
 
 
+@app.get("/api/convert")
+def api_convert_status():
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM tracks WHERE missing=0 AND LOWER(COALESCE(ext,''))<>'mp3'").fetchone()[0]
+    by = [dict(r) for r in conn.execute("SELECT LOWER(ext) AS ext, COUNT(*) AS n FROM tracks WHERE missing=0 "
+                                        "AND LOWER(COALESCE(ext,''))<>'mp3' GROUP BY LOWER(ext) ORDER BY n DESC")]
+    conn.close()
+    with CONV["lock"]:
+        jobs = [dict(j) for j in CONV["jobs"]]
+    return jsonify({"running": CONV["running"], "jobs": jobs, "convertible": n, "by_ext": by})
+
+
+@app.post("/api/convert")
+def api_convert():
+    body = request.get_json(force=True) or {}
+    kbps = int(body.get("kbps") or 320)
+    if kbps not in (128, 192, 256, 320):
+        kbps = 320
+    originals = "keep" if body.get("originals") == "keep" else "move"
+    with CONV["lock"]:
+        if CONV["running"]:
+            return jsonify({"error": "A conversion is already running"}), 409
+        conn = db()
+        if body.get("all"):
+            rows = conn.execute("SELECT id, title, filename FROM tracks WHERE missing=0 "
+                                "AND LOWER(COALESCE(ext,''))<>'mp3' ORDER BY folder, filename").fetchall()
+        else:
+            ids = [int(i) for i in body.get("ids") or []]
+            rows = [r for r in (conn.execute("SELECT id, title, filename, ext FROM tracks WHERE id=?", (i,)).fetchone()
+                                for i in ids) if r and (r["ext"] or "").lower() != "mp3"]
+        conn.close()
+        if not rows:
+            return jsonify({"error": "Those are all MP3s already"}), 400
+        CONV["jobs"] = [{"track_id": r["id"], "name": r["title"] or r["filename"], "file": r["filename"],
+                         "state": "queued", "progress": 0.0, "note": "", "mp3": "", "original": "", "saved": 0}
+                        for r in rows]
+        CONV.update(running=True, cancel=False)
+    threading.Thread(target=_convert_worker, args=(kbps, originals), daemon=True).start()
+    return jsonify({"ok": True, "queued": len(rows)})
+
+
+@app.post("/api/convert/cancel")
+def api_convert_cancel():
+    CONV["cancel"] = True
+    return jsonify({"ok": True})
+
+
 @app.post("/api/app/update/install")
 def api_app_update_install():
     if not (FROZEN and os.name == "nt"):
@@ -3692,6 +3889,14 @@ def selftest():
     except Exception as exc:
         ok = False
         lines.append("lyrics auto-sync  : FAILED %s" % exc)
+    try:
+        import av
+        if "libmp3lame" not in av.codecs_available:
+            raise OSError("no MP3 encoder")
+        lines.append("mp3 converter     : ok")
+    except Exception as exc:
+        ok = False
+        lines.append("mp3 converter     : FAILED %s" % exc)
     lines.append("cpu workers       : %d" % max(2, min(8, os.cpu_count() or 4)))
     try:
         lines.append("networking        : ok (can bind 127.0.0.1:%d)" % free_port())

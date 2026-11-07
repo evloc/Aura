@@ -405,6 +405,14 @@ input[type=range]{accent-color:var(--accent);height:4px}
 .lyrbar .btn{backdrop-filter:blur(8px)}
 .syncbadge{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--accent-soft);background:var(--accent-dim);
   border-radius:20px;padding:3px 9px;margin-right:auto;align-self:center}
+/* convert to mp3 */
+.cvopts{display:flex;flex-direction:column;gap:12px;padding:16px 20px}
+.cvopts label{display:flex;gap:9px;align-items:flex-start;font-size:13.5px;cursor:pointer;line-height:1.45}
+.cvopts label small{display:block;color:var(--faint);font-size:12px}
+.cvlist{font-size:12.5px;max-height:220px;overflow:auto;margin-top:6px}
+.cvlist div{display:flex;gap:10px;padding:4px 0;border-bottom:1px solid var(--hair);align-items:center}
+.cvlist div span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cvlist .ok{color:#3ddc84}.cvlist .bad{color:var(--warn)}
 /* lyrics finder */
 .fnd .qrow{display:flex;gap:8px;padding:12px 18px;border-bottom:1px solid var(--hair)}
 .fnd .qrow input{flex:1}
@@ -671,6 +679,7 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
           <button class="btn sm" id="bRename">Rename files</button>
           <button class="btn sm" id="bVersions">Group as versions…</button>
           <button class="btn sm" id="bPlaylist">Add to playlist…</button>
+          <button class="btn sm" id="bConvert">Convert to MP3…</button>
           <div class="sp"></div>
           <button class="btn quiet sm" id="bAll">Select all shown</button>
           <button class="btn quiet sm" id="bNone">Clear</button>
@@ -782,6 +791,14 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <option value="vocal">Vocal</option><option value="car">Car</option><option value="loud">Loud & clear</option>
             <option value="lofi">Lo-fi</option><option value="custom">Custom</option></select></div>
           <div class="eqrow" id="eqRow"></div></div>
+        <div class="card"><h3>Convert to MP3</h3>
+          <p>Turn WAV, FLAC, M4A, OGG and other files into MP3s, so they play on any phone or app. Title, artist, cover art and lyrics
+            are copied over, and favorites, playlists and play counts move to the MP3.</p>
+          <div class="dstat" id="cvStat">Checking your library…</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button class="btn sm" id="btnCvAll" disabled>Convert…</button>
+            <button class="btn quiet sm" id="btnCvStop" style="display:none">Stop</button></div>
+          <div class="cvlist" id="cvList"></div>
+          <p style="margin:10px 0 0;font-size:12px">To pick songs yourself: Organize → Library, search <code>notmp3</code>, tick the ones you want, then <b>Convert to MP3…</b></p></div>
         <div class="card"><h3>Lyrics auto-sync</h3>
           <p>AURA listens to a song with a speech model on this PC and times your lyrics to the singing — works on unreleased songs and your own
             music too. Nothing is uploaded. The model downloads once, the first time you use it.</p>
@@ -946,7 +963,7 @@ function showView(v){
   if(v==='artists')renderArtists();
   if(v==='albums')renderAlbums();
   if(v==='stats')renderStats();
-  if(v==='settings'){levelNote();asRefresh();}
+  if(v==='settings'){levelNote();asRefresh();cvRefresh();}
 }
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showView(b.dataset.v));
 document.querySelectorAll('#sides button').forEach(b=>b.onclick=()=>showView(LASTV[b.dataset.side]));
@@ -2838,6 +2855,81 @@ function updGone(){
   setTimeout(()=>{try{window.close();}catch(e){}},6000);
 }
 $('#btnUpdGo').onclick=installUpdate;
+
+/* ---------- convert to MP3 ---------- */
+let CV=null,CV_POLL=null,CV_WAS=false;
+const CV_PREF=(()=>{try{return JSON.parse(localStorage.getItem('aura.convert')||'{}');}catch(e){return {};}})();
+const fmtList=by=>by.map(x=>x.n+' '+(x.ext||'?').toUpperCase()).join(', ');
+async function cvRefresh(){
+  try{CV=await api('/api/convert');}catch(e){return;}
+  if(CV.running)CV_WAS=true;
+  const done=CV.jobs.filter(j=>j.state==='done').length,left=CV.jobs.filter(j=>/queued|running/.test(j.state)).length;
+  const st=$('#cvStat');
+  if(CV.running)st.textContent='Converting… '+done+' of '+CV.jobs.length+' done';
+  else st.textContent=CV.convertible?CV.convertible+' song'+(CV.convertible>1?'s aren\'t':' isn\'t')+' MP3 yet ('+fmtList(CV.by_ext)+')':'Every song in your library is already an MP3';
+  st.className='dstat'+(!CV.running&&!CV.convertible?' ok':'');
+  $('#btnCvAll').disabled=CV.running||!CV.convertible;
+  $('#btnCvAll').textContent=CV.convertible?'Convert '+CV.convertible+' song'+(CV.convertible>1?'s':'')+'…':'Convert…';
+  $('#btnCvStop').style.display=CV.running?'':'none';
+  const box=$('#cvList');box.innerHTML='';
+  CV.jobs.forEach(j=>{
+    let r;
+    if(j.state==='running')r='<span>'+Math.round((j.progress||0)*100)+'%</span>';
+    else if(j.state==='queued')r='<span>waiting</span>';
+    else if(j.state==='done')r='<span class="ok">done</span>';
+    else if(j.state==='skipped')r='<span>skipped · '+esc(j.note)+'</span>';
+    else if(j.state==='cancelled')r='<span>stopped</span>';
+    else r='<span class="bad">'+esc(j.note||'failed')+'</span>';
+    box.appendChild(el('div','','<span>'+esc(j.name)+'</span>'+r));
+  });
+  const dl=document.querySelector('.modal.cv #cvMList');if(dl)dl.innerHTML=box.innerHTML;
+  const ms=document.querySelector('.modal.cv #cvMStat');if(ms)ms.textContent=CV.running?'Converting… '+done+' of '+CV.jobs.length+' done':'Finished';
+  clearTimeout(CV_POLL);
+  if(CV.running){CV_POLL=setTimeout(cvRefresh,700);return;}
+  if(CV_WAS){
+    CV_WAS=false;
+    const bad=CV.jobs.filter(j=>j.state==='error').length,sk=CV.jobs.filter(j=>j.state==='skipped').length;
+    toast('Converted '+done+' song'+(done===1?'':'s')+' to MP3'+(sk?' · '+sk+' skipped':'')+(bad?' · '+bad+' failed':''),bad>0);
+    const mb=document.querySelector('.modal.cv #cvGo');if(mb){mb.textContent='Done';mb.disabled=false;mb.onclick=()=>document.querySelector('.modal.cv').remove();}
+    const mx=document.querySelector('.modal.cv #cvX');if(mx)mx.style.display='none';
+    SEL.clear();await load(true);await loadPlayer(true);
+  }
+}
+function convertDialog(ids){
+  const n=ids?ids.length:(CV&&CV.convertible)||0;
+  const w=el('div','modal cv');
+  const kb=CV_PREF.kbps||320,orig=CV_PREF.originals||'move';
+  w.innerHTML='<div class="box" style="max-width:520px"><div class="h">Convert '+(ids?n+' selected song'+(n>1?'s':''):'every non-MP3 song ('+n+')')+' to MP3</div>'+
+    '<div class="cvopts" id="cvOpts">'+
+    '<div class="srow2" style="margin:0"><span>Quality</span><select class="search" id="cvKb" style="max-width:260px">'+
+      [[320,'320 kbps — best'],[256,'256 kbps'],[192,'192 kbps — smaller files'],[128,'128 kbps — smallest']]
+      .map(([v,l])=>'<option value="'+v+'"'+(v==kb?' selected':'')+'>'+l+'</option>').join('')+'</select></div>'+
+    '<label><input type="radio" name="cvO" value="move"'+(orig==='move'?' checked':'')+'><span>Move the originals into an <b>_originals</b> folder'+
+      '<small>Your library only shows the MP3s. The originals stay safe in that folder; delete it yourself once you\'re happy.</small></span></label>'+
+    '<label><input type="radio" name="cvO" value="keep"'+(orig==='keep'?' checked':'')+'><span>Leave the originals where they are'+
+      '<small>You\'ll have both copies in your library and on your drive.</small></span></label>'+
+    '<div class="count">The MP3 is saved next to each file with the same name. Songs that already have an MP3 with that name are skipped.</div>'+
+    '</div><div class="cvopts" id="cvRun" style="display:none"><div class="dstat" id="cvMStat">Starting…</div><div class="cvlist" id="cvMList"></div></div>'+
+    '<div class="f"><button class="btn" id="cvX">Cancel</button><button class="btn primary" id="cvGo">Convert</button></div></div>';
+  document.body.appendChild(w);
+  $('#cvX').onclick=()=>{if(CV&&CV.running){post('/api/convert/cancel',{});}w.remove();};
+  $('#cvGo').onclick=async()=>{
+    const kbps=+$('#cvKb').value,originals=document.querySelector('input[name=cvO]:checked').value;
+    try{localStorage.setItem('aura.convert',JSON.stringify({kbps,originals}));}catch(e){}
+    Object.assign(CV_PREF,{kbps,originals});
+    let r;try{r=await post('/api/convert',ids?{ids,kbps,originals}:{all:true,kbps,originals});}catch(e){toast(e.message,true);return;}
+    $('#cvOpts').style.display='none';$('#cvRun').style.display='';
+    $('#cvGo').disabled=true;$('#cvGo').textContent='Converting…';$('#cvX').textContent='Stop';
+    CV_WAS=true;cvRefresh();
+  };
+}
+$('#btnCvAll').onclick=()=>convertDialog(null);
+$('#btnCvStop').onclick=async()=>{await post('/api/convert/cancel',{});cvRefresh();};
+$('#bConvert').onclick=()=>{
+  const ids=[...SEL].filter(id=>{const t=TRACKS.find(x=>x.id===id);return !t||(t.ext||'').toLowerCase()!=='mp3';});
+  if(!ids.length){toast('Those are all MP3s already',true);return;}
+  convertDialog(ids);
+};
 
 /* organizer: add the selected tracks to a playlist */
 $('#bPlaylist').onclick=()=>{const b=$('#bPlaylist').getBoundingClientRect();openMenu(b.left,b.bottom+4,playlistItems([...SEL]));};

@@ -27,6 +27,7 @@ Windows (or Linux + Wine), Python 3.12:
       --collect-all soundfile ^
       --collect-all faster_whisper ^
       --collect-all ctranslate2 ^
+      --collect-all av ^
       --hidden-import _cffi_backend ^
       app.py
 
@@ -43,4 +44,6 @@ Gotchas, learned the hard way:
   included in this build". The self-test prints a `lyrics auto-sync` line to
   confirm. It adds roughly 100 MB to the exe; the speech models themselves are
   not bundled and download on first use.
+- `--collect-all av` brings the audio decoder/MP3 encoder used by *Convert to MP3*
+  (the self-test prints an `mp3 converter` line).
 - To run from source instead: `python app.py`.
