@@ -74,15 +74,34 @@ OGG), so other players see them too.
 Playing lights up the current line, fades the ones you've passed and scrolls by
 itself, like Apple Music. Click any line to jump there. Scroll to read ahead —
 it waits a few seconds before following the song again. Timings come from:
-- **Sync to song** — for your own tracks. Play the song and press `Space` right
-  as each highlighted line starts (`Backspace` undoes a tap, `−`/`+` nudge a
-  line by 0.1 s, click a time to re-tap from there). One listen per song.
-- **Find online** — for released songs, from LRCLIB (free, no account). You see
-  a preview before anything is saved.
+- **Auto-sync** — AURA listens to the song with a speech model that runs on
+  your PC (Whisper, nothing is uploaded) and times each line of the lyrics you
+  already have. Works on unreleased songs and your own tracks. When it's done
+  you get a review window: lines it couldn't hear clearly are marked **check**
+  and their times are a guess — click a time and re-tap, or nudge with `−`/`+`.
+- **Transcribe** — for a song with no lyrics anywhere, AURA writes the words
+  down itself, already timed. Expect to fix some words, especially on
+  autotuned or mumbled parts.
+- **Sync by hand** — play the song and press `Space` right as each highlighted
+  line starts (`Backspace` undoes a tap, `−`/`+` nudge a line by 0.1 s, click
+  a time to re-tap from there). One listen per song.
+- **Find lyrics** — a search window that checks **LRCLIB** (often already
+  timed) and **Genius** (fans post lyrics for a lot of leaks and unreleased
+  songs). The search box is filled in for you with leak tags like `[v2]`,
+  `(prod. …)`, `snippet` or `CDQ` stripped out; edit it to try other names.
+  Click a result to preview it, then **Use these** or **Use + auto-sync**.
 - **`.lrc` files** — `Song.lrc` next to `Song.mp3` is picked up automatically,
   and so are timed lyrics already inside a file.
 Timed lyrics are saved into the file (MP3: the standard synced-lyrics frame
 next to the plain lyrics; other formats: LRC text in the lyrics tag).
+
+**Lyrics auto-sync settings.** Settings → *Lyrics auto-sync*. Pick the model:
+**Fast** (145 MB), **Better** (480 MB, the default) or **Best**
+(1.6 GB, slower). It downloads once, the first time you auto-sync, into the
+`models` folder next to your library. **Auto-sync every song that has lyrics
+but no timings** works through your whole library in the background: songs it's
+confident about are saved straight away, the rest are listed with a **Check**
+link. With **Better**, expect around a minute per song on a typical PC.
 
 **Lyrics search.** Type a line you remember into the Songs search; songs whose
 lyrics contain it show up with the matching line.
@@ -126,7 +145,21 @@ button to shuffle the songs you've never played.
 clears it when you pause. One-time setup (two minutes): at
 discord.com/developers/applications click **New Application**, name it
 **AURA**, copy its **Application ID** into Settings, and tick the box.
-Optionally upload a picture named `aura` under **Rich Presence → Art Assets**.
+Optionally upload a picture named `aura` under **Rich Presence → Art Assets**
+— it's shown when a song has no cover, and as a small badge otherwise.
+
+**Covers on Discord.** Discord can only show a picture from a web link, not
+from a file on your PC, so:
+- **Released songs** — AURA finds the official cover in Apple's iTunes catalog
+  by title and artist (on by default; no account, nothing uploaded). Version
+  labels are ignored, so *Wishing Well (V2)* still gets the Wishing Well cover.
+- **Your own / unreleased songs** — optional and **off by default**: AURA can
+  upload the cover from the file to catbox.moe, a free image host, once per
+  cover. Anyone with that link can see the image, so only turn this on if
+  you're fine with that artwork being public.
+The status shows straight away with the AURA logo and switches to the cover
+a moment later. Links are remembered, so nothing is looked up or uploaded
+twice; a song that wasn't found online is checked again after a week.
 
 **Play counts.** A song counts as played once you've heard half of it (or 30
 seconds). Counts feed Most played and Recently played.
@@ -322,7 +355,7 @@ Press `?` in the app for the full list.
 
 `Space` play / pause · `Ctrl`+`→` / `←` next / previous · `Shift`+`→` / `←`
 skip 10 seconds · `N` Now Playing · `L` lyrics · `Q` Up next · `M` mini player ·
-`Space` (in Sync to song) time the next line ·
+`Space` (in the sync window) time the next line ·
 `F` favorite · `/` search · `Esc` close a panel · `Ctrl`+`S` save tags ·
 `Ctrl`+`Z` undo · `↑` `↓` move through the Organize list
 

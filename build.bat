@@ -49,6 +49,8 @@ echo  Building...
   --add-data "templates;templates" ^
   --add-data "version.json;." ^
   --collect-all soundfile ^
+  --collect-all faster_whisper ^
+  --collect-all ctranslate2 ^
   --hidden-import _cffi_backend ^
   app.py || goto :fail
 

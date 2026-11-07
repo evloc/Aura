@@ -7,6 +7,8 @@ in metadata in bulk, and finds duplicates four different ways.
 """
 
 import hashlib
+import html as htmllib
+from html.parser import HTMLParser
 import io
 import json
 import os
@@ -170,6 +172,10 @@ CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY, track_id INTEGER, ts REAL, seconds REAL
 );
 CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts);
+-- Web links for cover art (for Discord). url '' = looked, found nothing.
+CREATE TABLE IF NOT EXISTS art_links (
+    key TEXT PRIMARY KEY, url TEXT, ts REAL
+);
 -- Small key/value store: the player's saved state (resume, queue, settings).
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY, value TEXT
@@ -188,6 +194,14 @@ DEFAULT_CONFIG = {
     # discord.com/developers/applications — see README → Discord status.
     "discord": False,
     "discord_client_id": "",
+    # Cover art on Discord. Discord can only show a picture from a web link:
+    # released songs get the official cover from Apple's iTunes catalog; your
+    # own covers can be uploaded to a public image host (off by default).
+    "discord_art_lookup": True,
+    "discord_art_upload": False,
+    # Auto-sync speech model: "base" (fast, ~145 MB), "small" (better, ~480 MB),
+    # "large-v3-turbo" (best, ~1.6 GB). Downloaded once, the first time it's used.
+    "autosync_model": "small",
     # Values stamped onto every track by the auto-fill tool.
     "defaults": {"artist": "", "albumartist": "", "album": "", "genre": "", "year": ""},
 }
@@ -1319,6 +1333,447 @@ def lrclib_lookup(title, artist, album="", duration=0):
 
 
 # --------------------------------------------------------------------------
+# lyrics finder — several sources, picked by you (helps a lot with unreleased songs)
+# --------------------------------------------------------------------------
+
+GENIUS_URL = "https://genius.com"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+LEAK_WORDS = re.compile(r"\b(snippet|cdq|hq|lq|og|leak(?:ed)?|unreleased|unrel|unr|full|"
+                        r"remaster(?:ed)?|v\d+|version\s*\d+|session|sessions|demo|"
+                        r"rough|reference|ref|throwaway|alt|alternate)\b", re.I)
+
+
+def clean_song_title(title):
+    """'Bad Energy (prod. Nick Mira) [v2] {CDQ}' -> 'Bad Energy'."""
+    t = split_version(title or "")[0] or title or ""
+    t = re.sub(r"[\(\[\{][^\)\]\}]*(?:prod|feat|ft\.|with|w/|snippet|cdq|leak|v\d|og|session|unrel)[^\)\]\}]*[\)\]\}]", " ", t, flags=re.I)
+    t = re.sub(r"\b(?:feat|ft|featuring|prod(?:uced)?(?:\s+by)?)\.?\s.*$", " ", t, flags=re.I)
+    t = LEAK_WORDS.sub(" ", t)
+    t = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", t)
+    return re.sub(r"\s+", " ", t).strip(" -_.")
+
+
+def _sim(a, b):
+    a, b = _norm_words(a), _norm_words(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def http_text(url, timeout=12, ua=BROWSER_UA):
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "text/html,application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def lrclib_search(q):
+    res = http_json(LRCLIB_URL + "/api/search?" + urllib.parse.urlencode({"q": q}), timeout=10) or []
+    out = []
+    for r in res[:15]:
+        if not (r.get("plainLyrics") or r.get("syncedLyrics")):
+            continue
+        timed = parse_lrc(r.get("syncedLyrics") or "")
+        out.append({"source": "lrclib", "title": r.get("trackName") or "", "artist": r.get("artistName") or "",
+                    "album": r.get("albumName") or "", "duration": r.get("duration") or 0,
+                    "synced": [{"t": t, "text": line} for t, line in timed] if timed else None,
+                    "lyrics": (r.get("plainLyrics") or plain_from_lrc(r.get("syncedLyrics") or "")).strip()})
+    return out
+
+
+def genius_search(q):
+    data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q})))
+    out, seen = [], set()
+    for sec in (data.get("response") or {}).get("sections") or []:
+        for hit in sec.get("hits") or []:
+            if hit.get("type") != "song" and sec.get("type") != "song":
+                continue
+            r = hit.get("result") or {}
+            url = r.get("url") or ""
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append({"source": "genius", "title": r.get("title") or "",
+                        "artist": (r.get("primary_artist") or {}).get("name") or r.get("artist_names") or "",
+                        "album": "", "duration": 0, "synced": None, "lyrics": None, "url": url})
+    return out
+
+
+class _GeniusLyrics(HTMLParser):
+    """Collects the text of Genius's lyrics containers."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0          # >0 while inside a lyrics container
+        self.skip = 0           # >0 while inside a part Genius marks as not-lyrics
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self.depth:
+            if tag == "br":
+                self.parts.append("\n")
+                return
+            if tag in ("div", "span", "a", "i", "b", "em", "strong", "p"):
+                self.depth += 1
+                if self.skip or a.get("data-exclude-from-selection") == "true":
+                    self.skip += 1
+        elif tag == "div" and a.get("data-lyrics-container") == "true":
+            self.depth = 1
+            if self.parts:
+                self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if self.depth and tag == "br":
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if self.depth and tag in ("div", "span", "a", "i", "b", "em", "strong", "p"):
+            if self.skip:
+                self.skip -= 1
+            self.depth -= 1
+
+    def handle_data(self, data):
+        if self.depth and not self.skip:
+            self.parts.append(data)
+
+
+def genius_lyrics(url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not (host == "genius.com" or host.endswith(".genius.com")) and not url.startswith(GENIUS_URL):
+        raise ValueError("not a Genius link")
+    parser = _GeniusLyrics()
+    parser.feed(http_text(url))
+    text = "".join(parser.parts)
+    lines = []
+    for ln in text.split("\n"):
+        ln = ln.strip()
+        if re.fullmatch(r"\[[^\]]*\]", ln):     # [Verse 1], [Chorus: ...] aren't sung
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        lines.append(ln)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def find_lyrics(row, query=None):
+    title = clean_song_title(row["title"] or Path(row["filename"]).stem)
+    artist = (row["artist"] or "").split(",")[0].split(" & ")[0]
+    artist = re.split(r"\s+(?:feat|ft)\.?\s", artist, flags=re.I)[0].strip()
+    queries = [query.strip()] if query and query.strip() else [q for q in (
+        ("%s %s" % (artist, title)).strip(), title) if q]
+    results, errors = [], []
+    for q in dict.fromkeys(queries):
+        for fn in (lrclib_search, genius_search):
+            try:
+                results += fn(q)
+            except Exception as exc:
+                errors.append("%s: %s" % (fn.__name__.split("_")[0], exc))
+    dur = row["duration"] or 0
+    seen, out = set(), []
+    for r in results:
+        key = (r["source"], _norm_words(r["title"]), _norm_words(r["artist"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        sc = _sim(r["title"], title) * 2 + (_sim(r["artist"], artist) if artist else 0.5)
+        if r["synced"]:
+            sc += 0.3
+        if dur and r.get("duration"):
+            sc -= min(1.0, abs(r["duration"] - dur) / 30.0)
+        r["score"] = round(sc, 3)
+        out.append(r)
+    out.sort(key=lambda r: -r["score"])
+    return {"query": queries[0], "results": out[:10],
+            "offline": bool(errors) and not results, "errors": errors[:4]}
+
+
+# --------------------------------------------------------------------------
+# auto-sync — speech recognition times the lyrics to the song
+# --------------------------------------------------------------------------
+
+AUTOSYNC_MODELS = {"base": 145_000_000, "small": 484_000_000, "large-v3-turbo": 1_620_000_000}
+AS = {"jobs": [], "lock": threading.Lock(), "wake": threading.Event(), "worker": None,
+      "model": None, "model_name": None, "downloading": None, "next_id": 1}
+
+
+def autosync_engine():
+    try:
+        import faster_whisper  # noqa: F401
+        return True, ""
+    except Exception as exc:
+        return False, "The speech engine isn't included in this build (%s)." % exc
+
+
+def model_dir():
+    d = DATA_DIR / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _model_folder(name):
+    try:
+        from faster_whisper.utils import _MODELS
+        repo = _MODELS.get(name, name)
+    except Exception:
+        repo = "Systran/faster-whisper-" + name
+    return model_dir() / ("models--" + repo.replace("/", "--"))
+
+
+def model_ready(name):
+    return any(_model_folder(name).glob("snapshots/*/model.bin"))
+
+
+def _dir_size(p):
+    total = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def get_whisper(name):
+    if AS["model"] is not None and AS["model_name"] == name:
+        return AS["model"]
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    from faster_whisper import WhisperModel
+    AS["model"] = None
+    if not model_ready(name):
+        AS["downloading"] = name
+    try:
+        m = WhisperModel(name, device="cpu", compute_type="int8", download_root=str(model_dir()))
+    finally:
+        AS["downloading"] = None
+    AS["model"], AS["model_name"] = m, name
+    return m
+
+
+def _tok(text):
+    t = unicodedata.normalize("NFKD", text or "").lower().replace("’", "'")
+    t = re.sub(r"'", "", t)
+    return re.findall(r"[a-z0-9]+", t)
+
+
+def align_lyrics(lines, words):
+    """lines: lyric lines (str). words: [(word, start_seconds), ...] from speech
+    recognition. Returns ([(t, text, guessed)], confidence 0..1)."""
+    L = [(tk, i, k) for i, ln in enumerate(lines) for k, tk in enumerate(_tok(ln))]
+    W = [(tk, st) for w, st in words for tk in _tok(w)]
+    n, m = len(L), len(W)
+    if not lines:
+        return [], 0.0
+    if not n or not m:
+        return [(None, ln, True) for ln in lines], 0.0
+    cache = {}
+
+    def score(a, b):
+        if a == b:
+            return 2.0
+        key = (a, b)
+        if key not in cache:
+            cache[key] = 1.0 if (len(a) > 2 and len(b) > 2 and SequenceMatcher(None, a, b).ratio() >= 0.75) else -1.0
+        return cache[key]
+
+    GAP = -0.6
+    # Needleman-Wunsch, free gaps at the ends of the transcript (intros, outros, ad-libs)
+    prev = [0.0] * (m + 1)
+    back = []
+    for i in range(1, n + 1):
+        cur = [prev[0] + GAP] + [0.0] * m
+        bi = bytearray(m + 1)
+        bi[0] = 1
+        a = L[i - 1][0]
+        for j in range(1, m + 1):
+            d = prev[j - 1] + score(a, W[j - 1][0])
+            u = prev[j] + GAP
+            lft = cur[j - 1] + (GAP if i < n else 0.0)
+            if d >= u and d >= lft:
+                cur[j], bi[j] = d, 0
+            elif u >= lft:
+                cur[j], bi[j] = u, 1
+            else:
+                cur[j], bi[j] = lft, 2
+        back.append(bi)
+        prev = cur
+    # backtrack
+    i, j = n, max(range(m + 1), key=lambda jj: prev[jj])
+    match = {}
+    while i > 0 and j > 0:
+        mv = back[i - 1][j]
+        if mv == 0:
+            if score(L[i - 1][0], W[j - 1][0]) > 0:
+                match[i - 1] = j - 1
+            i, j = i - 1, j - 1
+        elif mv == 1:
+            i -= 1
+        else:
+            j -= 1
+    # a time for each line from its first matched word, adjusted for words before it
+    per_line = {}
+    counts = [0] * len(lines)
+    for li, (tk, line, k) in enumerate(L):
+        counts[line] += 1
+        if li in match and line not in per_line:
+            per_line[line] = max(0.0, W[match[li]][1] - k * 0.28)
+    matched_in = [0] * len(lines)
+    for li in match:
+        matched_in[L[li][1]] += 1
+    times = [per_line.get(i) for i in range(len(lines))]
+    anchors = [i for i, t in enumerate(times) if t is not None]
+    guessed = [times[i] is None or (counts[i] and matched_in[i] / counts[i] < 0.3) for i in range(len(lines))]
+    if not anchors:
+        return [(None, ln, True) for ln in lines], 0.0
+    first, last = anchors[0], anchors[-1]
+    for i in range(first - 1, -1, -1):
+        times[i] = max(0.0, times[i + 1] - 2.5)
+    for i in range(last + 1, len(lines)):
+        times[i] = times[i - 1] + 2.5
+    for a, b in zip(anchors, anchors[1:]):
+        if b - a > 1:
+            span = max(0.0, times[b] - times[a])
+            w = [max(1, counts[k]) for k in range(a, b)]
+            tot = float(sum(w))
+            acc = 0.0
+            for k in range(a + 1, b):
+                acc += w[k - 1 - a]
+                times[k] = times[a] + span * acc / tot
+    for i in range(1, len(times)):          # never go backwards
+        if times[i] < times[i - 1] + 0.2:
+            times[i] = times[i - 1] + 0.2
+    conf = len(match) / float(n)
+    return [(round(t, 2), ln, bool(g)) for t, ln, g in zip(times, lines, guessed)], round(conf, 3)
+
+
+def words_to_lines(words, max_words=9, gap=0.7):
+    """Turn transcribed words into lyric lines by pauses and length."""
+    out, cur, start, last_end = [], [], None, None
+    for w, st, en in words:
+        w = w.strip()
+        if not w:
+            continue
+        if cur and ((st - (last_end or st)) > gap or len(cur) >= max_words):
+            out.append((round(start, 2), " ".join(cur)))
+            cur, start = [], None
+        if start is None:
+            start = st
+        cur.append(w)
+        last_end = en
+        if w[-1:] in ".?!":
+            out.append((round(start, 2), " ".join(cur)))
+            cur, start = [], None
+    if cur:
+        out.append((round(start, 2), " ".join(cur)))
+    return [(t, re.sub(r"\s+([,.?!])", r"\1", txt).strip()) for t, txt in out]
+
+
+def _job_public(j):
+    return {k: j.get(k) for k in ("id", "track_id", "title", "state", "progress", "mode", "confidence",
+                                  "error", "saved", "autosave", "result")}
+
+
+def autosync_enqueue(tid, autosave=False):
+    row = _track_row(tid)
+    if not row:
+        return None
+    with AS["lock"]:
+        for j in AS["jobs"]:
+            if j["track_id"] == tid and j["state"] in ("queued", "running"):
+                return j
+        j = {"id": AS["next_id"], "track_id": tid, "title": row["title"] or Path(row["filename"]).stem,
+             "state": "queued", "progress": 0.0, "mode": None, "confidence": None, "error": "",
+             "saved": False, "autosave": autosave, "result": None, "cancel": False}
+        AS["next_id"] += 1
+        AS["jobs"].append(j)
+    if not AS["worker"] or not AS["worker"].is_alive():
+        AS["worker"] = threading.Thread(target=_autosync_worker, daemon=True)
+        AS["worker"].start()
+    AS["wake"].set()
+    return j
+
+
+class _Cancelled(Exception):
+    pass
+
+
+def _run_autosync(j):
+    row = _track_row(j["track_id"])
+    if not row or not os.path.exists(row["path"]):
+        raise OSError("the file is missing")
+    lf = read_lyrics_full(row["path"])
+    lyrics = lf["plain"]
+    lines = [ln.strip() for ln in lyrics.split("\n") if ln.strip()]
+    j["mode"] = "align" if lines else "transcribe"
+    audio = decode_mono(row["path"], target_sr=16000, max_seconds=900)
+    if audio is None or not len(audio):
+        raise OSError("couldn't decode the audio")
+    dur = len(audio) / 16000.0
+    j["state"] = "loading"
+    model = get_whisper(load_config().get("autosync_model") or "small")
+    j["state"] = "running"
+    prompt = " ".join(" ".join(lines).split())[:220] if lines else None
+    segments, info = model.transcribe(np.asarray(audio, dtype=np.float32), word_timestamps=True,
+                                      vad_filter=False, condition_on_previous_text=False,
+                                      initial_prompt=prompt, beam_size=5)
+    words = []
+    for seg in segments:
+        if j["cancel"]:
+            raise _Cancelled()
+        j["progress"] = round(min(0.99, (seg.end or 0) / dur), 3) if dur else 0.0
+        for w in (seg.words or []):
+            words.append((w.word, float(w.start), float(w.end)))
+    if j["mode"] == "align":
+        synced, conf = align_lyrics(lines, [(w, st) for w, st, en in words])
+        j["confidence"] = conf
+        j["result"] = {"lyrics": lyrics, "lines": [{"t": t, "text": tx, "guessed": g} for t, tx, g in synced]}
+        if j["autosave"] and conf >= 0.6 and all(t is not None for t, _, _ in synced):
+            write_lyrics(row["path"], lyrics, [(t, tx) for t, tx, _ in synced])
+            _reindex_lyrics(row["id"], row["path"])
+            j["saved"] = True
+    else:
+        lns = words_to_lines(words)
+        j["result"] = {"lyrics": "\n".join(tx for _, tx in lns),
+                       "lines": [{"t": t, "text": tx, "guessed": False} for t, tx in lns]}
+        if not lns:
+            raise OSError("no singing was recognised")
+    j["progress"] = 1.0
+
+
+def _reindex_lyrics(tid, path):
+    lf = read_lyrics_full(path)
+    st = os.stat(path)
+    conn = db()
+    conn.execute("UPDATE tracks SET lyrics=?, has_synced=?, size=?, mtime=? WHERE id=?",
+                 (lf["plain"][:20000], 1 if lf["synced"] else 0, st.st_size, st.st_mtime, tid))
+    conn.commit()
+    conn.close()
+
+
+def _autosync_worker():
+    while True:
+        job = None
+        with AS["lock"]:
+            job = next((j for j in AS["jobs"] if j["state"] == "queued"), None)
+        if job is None:
+            AS["wake"].clear()
+            if not AS["wake"].wait(30):
+                return
+            continue
+        try:
+            _run_autosync(job)
+            job["state"] = "done"
+        except _Cancelled:
+            job["state"] = "cancelled"
+        except Exception as exc:
+            job["state"] = "error"
+            job["error"] = str(exc) or type(exc).__name__
+
+
+# --------------------------------------------------------------------------
 # volume leveling — loudness of each song, measured in the background
 # --------------------------------------------------------------------------
 
@@ -1522,6 +1977,120 @@ class DiscordRPC:
 
 
 DISCORD = DiscordRPC()
+
+
+# ---- cover art links for Discord ----
+
+ITUNES_URL = "https://itunes.apple.com"
+CATBOX_URL = "https://catbox.moe/user/api.php"
+ART_RETRY_DAYS = 7
+
+
+def _norm_words(x):
+    x = unicodedata.normalize("NFKD", x or "").lower()
+    x = re.sub(r"[\(\[].*?[\)\]]", " ", x)
+    x = re.sub(r"\b(feat|ft|featuring)\b.*$", " ", x)
+    return re.sub(r"[^a-z0-9]+", " ", x).strip()
+
+
+def _art_cache(conn, key):
+    row = conn.execute("SELECT url, ts FROM art_links WHERE key=?", (key,)).fetchone()
+    if not row:
+        return None
+    if not row["url"] and time.time() - (row["ts"] or 0) > ART_RETRY_DAYS * 86400:
+        return None          # a miss is retried after a week
+    return row["url"]
+
+
+def _art_store(conn, key, url):
+    conn.execute("INSERT OR REPLACE INTO art_links (key, url, ts) VALUES (?,?,?)", (key, url or "", time.time()))
+    conn.commit()
+
+
+def itunes_cover(title, artist):
+    """Official cover link for a released song, or '' when there is no clear match."""
+    t, a = _norm_words(split_version(title)[0] or title), _norm_words(artist.split(",")[0])
+    if not t or not a:
+        return ""
+    q = urllib.parse.urlencode({"term": "%s %s" % (artist.split(",")[0], split_version(title)[0] or title),
+                                "entity": "song", "limit": 10})
+    res = http_json(ITUNES_URL + "/search?" + q, timeout=8).get("results") or []
+    for r in res:
+        rt, ra = _norm_words(r.get("trackName", "")), _norm_words(r.get("artistName", ""))
+        if rt == t and (a in ra or ra in a) and r.get("artworkUrl100"):
+            return r["artworkUrl100"].replace("100x100bb", "512x512bb")
+    return ""
+
+
+def upload_cover(data, mime):
+    """Upload image bytes to catbox.moe (anonymous, public link). Returns the link."""
+    ext = {"image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get((mime or "").lower(), "jpg")
+    boundary = "----aura" + uuid.uuid4().hex
+    body = b"".join([
+        ("--%s\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n" % boundary).encode(),
+        ("--%s\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"cover.%s\"\r\n"
+         "Content-Type: %s\r\n\r\n" % (boundary, ext, mime or "image/jpeg")).encode(),
+        data, ("\r\n--%s--\r\n" % boundary).encode()])
+    req = urllib.request.Request(CATBOX_URL, data=body, method="POST", headers={
+        "User-Agent": HTTP_UA, "Content-Type": "multipart/form-data; boundary=" + boundary})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        url = r.read().decode("utf-8", "replace").strip()
+    if not url.startswith("https://") or len(url) > 250:
+        raise OSError("upload failed: %s" % url[:120])
+    return url
+
+
+def cover_link(row, cfg, allow_network=True):
+    """A web link for this song's cover: cached, iTunes, or uploaded. '' if none."""
+    conn = db()
+    try:
+        title = row["title"] or Path(row["filename"]).stem
+        artist = row["artist"] or ""
+        if cfg.get("discord_art_lookup", True) and artist:
+            key = "itunes:%s|%s" % (_norm_words(artist), _norm_words(split_version(title)[0] or title))
+            url = _art_cache(conn, key)
+            if url is None and allow_network:
+                try:
+                    url = itunes_cover(title, artist)
+                    _art_store(conn, key, url)
+                except Exception:
+                    url = None
+            if url:
+                return url
+        if cfg.get("discord_art_upload") and row["has_art"]:
+            data, mime = get_artwork(row["path"])
+            if data:
+                key = "upload:" + hashlib.sha1(data).hexdigest()
+                url = _art_cache(conn, key)
+                if url is None and allow_network:
+                    try:
+                        url = upload_cover(data, mime)
+                        _art_store(conn, key, url)
+                    except Exception:
+                        url = None
+                if url:
+                    return url
+        return ""
+    finally:
+        conn.close()
+
+
+DISCORD_NOW = {"tid": None, "activity": None, "cid": ""}
+
+
+def _discord_fill_art(tid, cid):
+    """Find the cover in the background, then refresh the status if the same song still plays."""
+    row = _track_row(tid)
+    if not row:
+        return
+    url = cover_link(row, load_config(), allow_network=True)
+    if url and DISCORD_NOW["tid"] == tid and DISCORD_NOW["activity"]:
+        act = json.loads(json.dumps(DISCORD_NOW["activity"]))
+        act.setdefault("assets", {})["large_image"] = url
+        act["assets"]["small_image"] = "aura"
+        act["assets"]["small_text"] = "AURA"
+        DISCORD_NOW["activity"] = act
+        DISCORD.update(cid, act)
 
 
 # --------------------------------------------------------------------------
@@ -1732,13 +2301,22 @@ def api_get_config():
     return jsonify(cfg)
 
 
+CONFIG_LOCK = threading.Lock()
+
+
 @app.post("/api/config")
 def api_set_config():
-    cfg = load_config()
     body = request.get_json(force=True)
+    with CONFIG_LOCK:      # two quick changes must not overwrite each other
+        return _set_config(body)
+
+
+def _set_config(body):
+    cfg = load_config()
     for key in ("folders", "quarantine", "rename_pattern",
                 "write_tags_to_file", "fingerprint", "watch_folders",
-                "discord", "discord_client_id"):
+                "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
+                "autosync_model"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -2521,6 +3099,93 @@ def api_lyrics_lookup(tid):
                     "synced": [{"t": t, "text": line} for t, line in timed] if timed else None})
 
 
+@app.get("/api/lyrics/<int:tid>/find")
+def api_lyrics_find(tid):
+    row = _track_row(tid)
+    if not row:
+        return jsonify({"error": "missing"}), 404
+    res = find_lyrics(row, request.args.get("q"))
+    res["default_query"] = ("%s %s" % ((row["artist"] or "").split(",")[0].strip(),
+                                       clean_song_title(row["title"] or Path(row["filename"]).stem))).strip()
+    return jsonify(res)
+
+
+@app.get("/api/lyrics/genius")
+def api_lyrics_genius():
+    url = request.args.get("url") or ""
+    try:
+        text = genius_lyrics(url)
+    except ValueError:
+        return jsonify({"error": "That isn't a Genius link"}), 400
+    except Exception:
+        return jsonify({"error": "Couldn't load the lyrics from Genius — try another result."}), 502
+    if not text:
+        return jsonify({"error": "That page has no lyrics yet."}), 404
+    return jsonify({"lyrics": text})
+
+
+@app.get("/api/autosync/status")
+def api_autosync_status():
+    ok, reason = autosync_engine()
+    cfg = load_config()
+    name = cfg.get("autosync_model") or "small"
+    dl = None
+    if AS["downloading"]:
+        dl = {"name": AS["downloading"], "done": _dir_size(_model_folder(AS["downloading"])),
+              "total": AUTOSYNC_MODELS.get(AS["downloading"], 0)}
+    with AS["lock"]:
+        jobs = [_job_public(j) for j in AS["jobs"][-60:]]
+    return jsonify({"available": ok, "reason": reason, "model": name,
+                    "ready": {k: model_ready(k) for k in AUTOSYNC_MODELS},
+                    "sizes": AUTOSYNC_MODELS, "downloading": dl, "jobs": jobs})
+
+
+@app.post("/api/autosync")
+def api_autosync():
+    ok, reason = autosync_engine()
+    if not ok:
+        return jsonify({"error": reason}), 400
+    body = request.get_json(force=True) or {}
+    j = autosync_enqueue(int(body.get("id") or 0), autosave=bool(body.get("autosave")))
+    if not j:
+        return jsonify({"error": "missing"}), 404
+    return jsonify({"ok": True, "job": _job_public(j)})
+
+
+@app.post("/api/autosync/all")
+def api_autosync_all():
+    ok, reason = autosync_engine()
+    if not ok:
+        return jsonify({"error": reason}), 400
+    conn = db()
+    rows = conn.execute("SELECT id FROM tracks WHERE missing=0 AND COALESCE(lyrics,'')<>'' "
+                        "AND COALESCE(has_synced,0)=0 ORDER BY title").fetchall()
+    conn.close()
+    n = sum(1 for r in rows if autosync_enqueue(r["id"], autosave=True))
+    return jsonify({"ok": True, "queued": n})
+
+
+@app.post("/api/autosync/cancel")
+def api_autosync_cancel():
+    body = request.get_json(force=True) or {}
+    jid = body.get("job")
+    with AS["lock"]:
+        for j in AS["jobs"]:
+            if (jid is None or j["id"] == jid) and j["state"] in ("queued", "running", "loading"):
+                if j["state"] == "queued":
+                    j["state"] = "cancelled"
+                else:
+                    j["cancel"] = True
+    return jsonify({"ok": True})
+
+
+@app.post("/api/autosync/clear")
+def api_autosync_clear():
+    with AS["lock"]:
+        AS["jobs"] = [j for j in AS["jobs"] if j["state"] in ("queued", "running", "loading")]
+    return jsonify({"ok": True})
+
+
 @app.get("/api/lyrics/search")
 def api_lyrics_search():
     q = (request.args.get("q") or "").strip()
@@ -2622,6 +3287,14 @@ def api_discord():
                         "timestamps": {"start": start_ms, **({"end": start_ms + int(dur * 1000)} if dur else {})},
                         "assets": {"large_image": "aura", "large_text": (row["album"] or "AURA")[:120]},
                         "instance": False}
+            cached = cover_link(row, cfg, allow_network=False)
+            if cached:
+                activity["assets"]["large_image"] = cached
+                activity["assets"]["small_image"] = "aura"
+                activity["assets"]["small_text"] = "AURA"
+            elif cfg.get("discord_art_lookup", True) or cfg.get("discord_art_upload"):
+                threading.Thread(target=_discord_fill_art, args=(row["id"], cid), daemon=True).start()
+    DISCORD_NOW.update(tid=(int(tid) if tid and activity else None), activity=activity, cid=cid)
     ok, msg = DISCORD.update(cid, activity)
     return jsonify({"ok": ok, "message": msg})
 
@@ -3001,6 +3674,16 @@ def selftest():
     else:
         lines.append("audio decoding    : none - fingerprinting disabled")
     lines.append("fingerprinting    : %s" % ("available" if CAN_FINGERPRINT else "unavailable"))
+    try:
+        import ctranslate2
+        import faster_whisper
+        ctranslate2.get_supported_compute_types("cpu")
+        lines.append("lyrics auto-sync  : ok (faster-whisper %s, models: %s)" % (
+            getattr(faster_whisper, "__version__", "?"),
+            ", ".join(k for k in AUTOSYNC_MODELS if model_ready(k)) or "none downloaded yet"))
+    except Exception as exc:
+        ok = False
+        lines.append("lyrics auto-sync  : FAILED %s" % exc)
     lines.append("cpu workers       : %d" % max(2, min(8, os.cpu_count() or 4)))
     try:
         lines.append("networking        : ok (can bind 127.0.0.1:%d)" % free_port())

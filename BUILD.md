@@ -25,6 +25,8 @@ Windows (or Linux + Wine), Python 3.12:
       --add-data "templates;templates" ^
       --add-data "version.json;." ^
       --collect-all soundfile ^
+      --collect-all faster_whisper ^
+      --collect-all ctranslate2 ^
       --hidden-import _cffi_backend ^
       app.py
 
@@ -36,4 +38,9 @@ Gotchas, learned the hard way:
   which breaks a Wine-hosted build (fine on real Windows).
 - Do NOT add `--exclude-module setuptools`. It produces an exe that dies at
   `init_sys_streams` before any of the app's own code runs.
+- Lyrics auto-sync uses faster-whisper (CTranslate2). The two `--collect-all`
+  lines for it are needed, or the exe builds but auto-sync reports "isn't
+  included in this build". The self-test prints a `lyrics auto-sync` line to
+  confirm. It adds roughly 100 MB to the exe; the speech models themselves are
+  not bundled and download on first use.
 - To run from source instead: `python app.py`.

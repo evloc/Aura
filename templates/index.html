@@ -405,6 +405,32 @@ input[type=range]{accent-color:var(--accent);height:4px}
 .lyrbar .btn{backdrop-filter:blur(8px)}
 .syncbadge{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--accent-soft);background:var(--accent-dim);
   border-radius:20px;padding:3px 9px;margin-right:auto;align-self:center}
+/* lyrics finder */
+.fnd .qrow{display:flex;gap:8px;padding:12px 18px;border-bottom:1px solid var(--hair)}
+.fnd .qrow input{flex:1}
+.fnd .cols{flex:1;display:flex;min-height:0}
+.fnd .res{width:44%;overflow:auto;border-right:1px solid var(--hair);padding:6px}
+.fnd .pv{flex:1;overflow:auto;padding:14px 20px;font-size:14px;line-height:1.7;white-space:pre-wrap}
+.fnd .hit{padding:9px 10px;border-radius:10px;cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.fnd .hit:hover{background:var(--hover)}
+.fnd .hit.on{background:var(--active);box-shadow:inset 0 0 0 1px #087cfa66}
+.fnd .hit b{font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fnd .hit span{font-size:12px;color:var(--faint)}
+.src{display:inline-block;font-size:9.5px;font-weight:800;letter-spacing:.07em;border-radius:20px;padding:1px 7px;margin-right:6px;
+  background:var(--hair);color:var(--dim);vertical-align:1px}
+.src.lrclib{background:var(--accent-dim);color:var(--accent-soft)}
+.src.genius{background:#ffff6433;color:#e8d84a}
+.src.timed{background:#1db95433;color:#3ddc84}
+.fnd .empty{padding:30px 16px;color:var(--faint);font-size:13.5px;line-height:1.6;text-align:center}
+.asbar{font-size:12px;color:var(--faint);align-self:center;display:flex;align-items:center;gap:8px}
+.asbar .updbar{width:90px;margin:0}
+.sline.guess .tt2{color:var(--warn)}
+.sline.guess .tx::after{content:'check';font-size:9.5px;font-weight:800;letter-spacing:.06em;color:var(--warn);
+  border:1px solid currentColor;border-radius:20px;padding:0 6px;margin-left:8px;vertical-align:2px;opacity:.8}
+.asjobs{margin-top:10px;font-size:12.5px;max-height:170px;overflow:auto}
+.asjobs div{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--hair)}
+.asjobs div span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.asjobs .rv{cursor:pointer;color:var(--accent-soft);font-weight:700}
 /* sync editor */
 .sync .b{padding:6px 10px}
 .sline{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;font-size:15px}
@@ -756,10 +782,28 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <option value="vocal">Vocal</option><option value="car">Car</option><option value="loud">Loud & clear</option>
             <option value="lofi">Lo-fi</option><option value="custom">Custom</option></select></div>
           <div class="eqrow" id="eqRow"></div></div>
+        <div class="card"><h3>Lyrics auto-sync</h3>
+          <p>AURA listens to a song with a speech model on this PC and times your lyrics to the singing — works on unreleased songs and your own
+            music too. Nothing is uploaded. The model downloads once, the first time you use it.</p>
+          <div class="srow2"><span>Accuracy</span><select class="search" id="cfgAsModel" style="max-width:300px">
+            <option value="base">Fast — 145 MB download</option>
+            <option value="small">Better — 480 MB (recommended)</option>
+            <option value="large-v3-turbo">Best — 1.6 GB, slower</option></select></div>
+          <div class="dstat" id="asStat"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button class="btn sm" id="btnAsAll">Auto-sync every song that has lyrics but no timings</button>
+            <button class="btn quiet sm" id="btnAsStop" style="display:none">Stop</button></div>
+          <div class="asjobs" id="asJobs"></div>
+          <p style="margin:10px 0 0;font-size:12px">In the batch, songs it's confident about are saved straight away; the rest are listed here for you to check.
+            Heavily autotuned or mumbled parts can still be off — you can fix any line in the sync editor.</p></div>
         <div class="card"><h3>Discord status</h3>
           <p>Show "Listening to <i>song</i> by <i>artist</i>" on your Discord profile while music plays. Discord has to be open on this PC.</p>
           <label class="chk2"><input type="checkbox" id="cfgDiscord"><span>Show what I'm listening to on Discord</span></label>
           <div class="srow2"><span>Discord Application ID</span><input class="search" id="cfgDiscordId" style="max-width:240px" placeholder="18-digit number"></div>
+          <label class="chk2"><input type="checkbox" id="cfgDiscArt"><span>Show the song's cover
+            <span style="color:var(--faint)">— finds the official cover for released songs online (Apple's catalog)</span></span></label>
+          <label class="chk2"><input type="checkbox" id="cfgDiscUp"><span>Upload my own covers when a song isn't online
+            <span style="color:var(--faint)">— each cover goes once to catbox.moe, a free image host. <b>Anyone with the link can see it</b>,
+            so leave this off for artwork you want to keep private.</span></span></label>
           <div class="dstat" id="discordStat"></div>
           <p style="margin:10px 0 0;font-size:12px">One-time setup: go to <b>discord.com/developers/applications</b>, click <b>New Application</b>,
             name it <b>AURA</b> (that's the name your friends see), and copy its <b>Application ID</b> here. Optional: under
@@ -902,7 +946,7 @@ function showView(v){
   if(v==='artists')renderArtists();
   if(v==='albums')renderAlbums();
   if(v==='stats')renderStats();
-  if(v==='settings')levelNote();
+  if(v==='settings'){levelNote();asRefresh();}
 }
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showView(b.dataset.v));
 document.querySelectorAll('#sides button').forEach(b=>b.onclick=()=>showView(LASTV[b.dataset.side]));
@@ -2234,9 +2278,16 @@ async function showLyrics(body,t){
   if(d.synced)bar.appendChild(el('span','syncbadge','SYNCED'));
   if(d.editable){
     const e=el('button','btn quiet sm',d.lyrics?'Edit':'Add lyrics');e.onclick=()=>lyricsModal(t.id);bar.appendChild(e);
-    if(d.lyrics){const sy=el('button','btn quiet sm',d.synced?'Re-sync':'Sync to song');sy.title='Time each line to the music';
+    const job=asJobFor(t.id);
+    if(job){const a=el('span','asbar',asLabel(job)+'<div class="updbar"><i style="width:'+Math.round((job.progress||0)*100)+'%"></i></div>');
+      a.id='asLive';bar.appendChild(a);}
+    else if(AS_OK!==false){const as=el('button','btn quiet sm',d.lyrics?'Auto-sync':'Transcribe');
+      as.title=d.lyrics?'Let AURA listen to the song and time each line':'Let AURA listen to the song and write down the words';
+      as.onclick=()=>startAutosync(t.id,!d.lyrics);bar.appendChild(as);}
+    if(d.lyrics){const sy=el('button','btn quiet sm',d.synced?'Re-sync by hand':'Sync by hand');sy.title='Tap along as each line starts';
       sy.onclick=()=>syncEditor(t.id);bar.appendChild(sy);}
-    const f=el('button','btn quiet sm','Find online');f.title='Look up lyrics for released songs';f.onclick=()=>findLyricsOnline(t.id);bar.appendChild(f);
+    const f=el('button','btn quiet sm','Find lyrics');f.title='Search LRCLIB and Genius — fans post lyrics for a lot of unreleased songs';
+    f.onclick=()=>findLyricsOnline(t.id);bar.appendChild(f);
   }
   body.appendChild(bar);
   if(d.synced&&d.synced.length){
@@ -2253,7 +2304,8 @@ async function showLyrics(body,t){
     const l=el('div','lyr');d.lyrics.split(/\n\s*\n/).forEach(par=>l.appendChild(el('p','',esc(par).replace(/\n/g,'<br>'))));
     body.appendChild(l);
   }else body.appendChild(el('div','lyrempty','No lyrics in this file yet.'+(d.editable
-    ?'<br><b>Add lyrics</b> to type or paste them, or <b>Find online</b> for released songs.':'')));
+    ?'<br><b>Find lyrics</b> searches LRCLIB and Genius (good for leaks and unreleased songs), <b>Add lyrics</b> lets you paste them,'+
+      ' and <b>Transcribe</b> has AURA listen and write the words down.':'')));
 }
 $('#npBody').addEventListener('wheel',()=>{LYRUSER=Date.now();},{passive:true});
 function followLyrics(cur,jump){
@@ -2296,42 +2348,185 @@ async function lyricsModal(id){
 }
 function markLyrics(id,has,synced){const t=PMAP.get(id);if(t){t.has_lyrics=has?1:0;t.has_synced=synced?1:0;}}
 async function findLyricsOnline(id){
-  toast('Looking up lyrics…');
-  let r;try{r=await api('/api/lyrics/'+id+'/lookup');}catch(e){toast(e.message,true);return;}
-  if(!r.found){toast(r.reason||'No lyrics found',true);return;}
-  const w=el('div','modal');
-  const prev=(r.synced?r.synced.map(x=>x.text):r.lyrics.split('\n')).filter(Boolean).slice(0,10).map(esc).join('<br>');
-  w.innerHTML='<div class="box" style="max-width:560px"><div class="h">Found lyrics'+(r.synced?' — timed to the music':'')+'</div>'+
-    '<div class="c">'+esc(r.title)+' — '+esc(r.artist)+'</div><div class="b" style="padding:16px 20px;font-size:14px;line-height:1.7;max-height:46vh">'+prev+
-    '<div style="color:var(--faint);margin-top:8px">…</div></div><div class="f"><span class="count" style="margin-right:auto">From LRCLIB · saved into your file</span>'+
-    '<button class="btn" id="flX">Cancel</button><button class="btn primary" id="flS">Use these</button></div></div>';
+  const t=meta(id);
+  const w=el('div','modal fnd');
+  w.innerHTML='<div class="box" style="max-width:860px;height:84vh"><div class="h">Find lyrics — '+esc(ttl(t))+'</div>'+
+    '<div class="qrow"><input class="search" id="fnQ" placeholder="Artist and song name"><button class="btn primary" id="fnGo">Search</button></div>'+
+    '<div class="cols"><div class="res" id="fnRes"><div class="empty">Searching…</div></div><div class="pv" id="fnPv"></div></div>'+
+    '<div class="f"><span class="count" id="fnNote" style="margin-right:auto">LRCLIB and Genius · saved into your file</span>'+
+    '<button class="btn" id="fnX">Cancel</button><button class="btn" id="fnUse" disabled>Use these</button>'+
+    '<button class="btn primary" id="fnUseAs" disabled>Use + auto-sync</button></div></div>';
   document.body.appendChild(w);
-  $('#flX').onclick=()=>w.remove();
-  $('#flS').onclick=async()=>{
-    try{await post('/api/lyrics/'+id,{lyrics:r.lyrics,synced:r.synced});}catch(e){toast(e.message,true);return;}
-    w.remove();LYR.delete(id);markLyrics(id,true,!!r.synced);toast('Lyrics saved'+(r.synced?' — they\'ll follow the song':''));
-    const b=$('#npBody');b._lyrFor=null;renderNP();
-  };
+  let pick=null,seq=0;
+  const close=()=>{w.remove();window.removeEventListener('keydown',esck,true);};
+  const esck=e=>{if(e.key==='Escape'&&document.body.contains(w)){e.preventDefault();e.stopImmediatePropagation();close();}};
+  window.addEventListener('keydown',esck,true);
+  $('#fnX').onclick=close;
+  async function preview(r,row){
+    document.querySelectorAll('#fnRes .hit').forEach(x=>x.classList.toggle('on',x===row));
+    pick=null;$('#fnUse').disabled=$('#fnUseAs').disabled=true;
+    const pv=$('#fnPv');
+    if(r.lyrics==null&&r.url){
+      pv.textContent='Loading from Genius…';const my=++seq;
+      try{r.lyrics=(await api('/api/lyrics/genius?url='+encodeURIComponent(r.url))).lyrics;}
+      catch(e){if(my===seq)pv.textContent=e.message;return;}
+      if(my!==seq)return;
+    }
+    pv.textContent=r.synced?r.synced.map(x=>x.text).join('\n'):r.lyrics;
+    pv.scrollTop=0;pick=r;
+    $('#fnUse').disabled=false;$('#fnUseAs').disabled=!!r.synced||AS_OK===false;
+    $('#fnUseAs').title=r.synced?'These are already timed to the music':'';
+    $('#fnUse').textContent=r.synced?'Use these (already timed)':'Use these';
+  }
+  async function search(q){
+    const box=$('#fnRes');box.innerHTML='<div class="empty">Searching…</div>';$('#fnPv').textContent='';
+    pick=null;$('#fnUse').disabled=$('#fnUseAs').disabled=true;
+    let r;try{r=await api('/api/lyrics/'+id+'/find'+(q!=null?'?q='+encodeURIComponent(q):''));}
+    catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';return;}
+    if(q==null)$('#fnQ').value=r.query||r.default_query||'';
+    box.innerHTML='';
+    if(!r.results.length){
+      box.innerHTML='<div class="empty">'+(r.offline?'Couldn\'t reach the lyrics sites — check your internet connection.':
+        'Nothing found.<br>Try a shorter search — just the song name, or the name fans use for it.'+
+        (AS_OK!==false?'<br><br>No luck anywhere? Close this and press <b>Transcribe</b> to have AURA write the words down.':''))+'</div>';
+      return;
+    }
+    r.results.forEach((x,i)=>{
+      const row=el('div','hit','<b>'+esc(x.title||'Untitled')+'</b><span><i class="src '+x.source+'">'+(x.source==='genius'?'GENIUS':'LRCLIB')+'</i>'+
+        (x.synced?'<i class="src timed">TIMED</i>':'')+esc(x.artist||'')+(x.album?' · '+esc(x.album):'')+
+        (x.duration?' · '+tm(x.duration):'')+'</span>');
+      row.onclick=()=>preview(x,row);box.appendChild(row);
+      if(i===0)preview(x,row);
+    });
+    if(r.errors&&r.errors.length)$('#fnNote').textContent='Some sites didn\'t answer: '+r.errors.map(x=>x.split(':')[0]).join(', ');
+  }
+  $('#fnGo').onclick=()=>search($('#fnQ').value);
+  $('#fnQ').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();search($('#fnQ').value);}};
+  async function use(sync){
+    if(!pick)return;
+    try{await post('/api/lyrics/'+id,{lyrics:pick.lyrics,synced:pick.synced});}catch(e){toast(e.message,true);return;}
+    close();LYR.delete(id);markLyrics(id,true,!!pick.synced);
+    const b=$('#npBody');if(b){b._lyrFor=null;}renderNP();
+    if(sync)startAutosync(id,false);
+    else toast('Lyrics saved'+(pick.synced?' — they\'ll follow the song':''),false,
+      pick.synced||AS_OK===false?null:{label:'Auto-sync',fn:()=>startAutosync(id,false)});
+  }
+  $('#fnUse').onclick=()=>use(false);$('#fnUseAs').onclick=()=>use(true);
+  search(null);
 }
+
+/* ---------- auto-sync: speech recognition times the lyrics ---------- */
+let AS_OK=null,AS_ST=null,AS_POLL=null;const AS_SEEN=new Set();
+const AS_NAMES={base:'Fast',small:'Better','large-v3-turbo':'Best'};
+const asJobFor=id=>AS_ST&&AS_ST.jobs.find(j=>j.track_id===id&&/queued|loading|running/.test(j.state));
+function asLabel(j){
+  if(j.state==='queued')return 'Waiting…';
+  if(j.state==='loading'){const d=AS_ST&&AS_ST.downloading;
+    return d&&d.total?'Downloading model '+Math.min(99,Math.round(d.done/d.total*100))+'%':'Loading model…';}
+  return (j.mode==='transcribe'?'Transcribing ':'Syncing ')+Math.round((j.progress||0)*100)+'%';
+}
+async function asRefresh(){
+  try{AS_ST=await api('/api/autosync/status');}catch(e){return;}
+  AS_OK=AS_ST.available;
+  const live=AS_ST.jobs.some(j=>/queued|loading|running/.test(j.state));
+  AS_ST.jobs.forEach(j=>{
+    if(!/done|error/.test(j.state)||AS_SEEN.has(j.id))return;
+    AS_SEEN.add(j.id);
+    if(j.state==='error'){toast('Auto-sync didn\'t work for '+j.title+': '+j.error,true);return;}
+    LYR.delete(j.track_id);
+    if(j.saved){markLyrics(j.track_id,true,true);return;}
+    if(!j.autosave)asReview(j);
+  });
+  // live progress in Now Playing
+  const lv=$('#asLive'),j=NOW!=null&&asJobFor(NOW);
+  if(lv&&j){lv.firstChild.textContent=asLabel(j);lv.querySelector('i').style.width=Math.round((j.progress||0)*100)+'%';}
+  else if(lv&&!j){const b=$('#npBody');if(b){b._lyrFor=null;renderNP();}}
+  if(VIEW==='settings')asRenderSettings();
+  clearTimeout(AS_POLL);if(live)AS_POLL=setTimeout(asRefresh,1000);
+}
+function asReview(j){
+  const r=j.result;if(!r)return;
+  const guessed=r.lines.filter(x=>x.guessed).length;
+  const msg=j.mode==='transcribe'?'Transcribed '+j.title+' — check the words and timings':
+    'Auto-synced '+j.title+(guessed?' — '+guessed+' line'+(guessed>1?'s':'')+' to check':' — looks good');
+  if(document.querySelector('.modal.sync')){toast(msg,false,{label:'Review',fn:()=>syncEditor(j.track_id,r)});return;}
+  toast(msg);syncEditor(j.track_id,r);
+}
+async function startAutosync(id,transcribe){
+  if(AS_OK===null)await asRefresh();
+  if(!AS_OK){toast(AS_ST&&AS_ST.reason||'Auto-sync isn\'t available',true);return;}
+  const m=AS_ST.model;
+  if(!AS_ST.ready[m]&&!(AS_ST.downloading)){
+    const mb=Math.round(AS_ST.sizes[m]/1e6);
+    if(!confirm('Auto-sync needs a speech model ('+(AS_NAMES[m]||m)+', about '+(mb>=1000?(mb/1000).toFixed(1)+' GB':mb+' MB')+').\n\n'+
+      'It downloads once and stays on this PC — nothing is uploaded. You can pick a smaller or better model in Settings → Lyrics auto-sync.\n\nDownload it now?'))return;
+  }
+  try{await post('/api/autosync',{id});}catch(e){toast(e.message,true);return;}
+  toast(transcribe?'Listening to the song and writing down the words…':'Listening to the song and timing your lyrics…');
+  await asRefresh();const b=$('#npBody');if(b){b._lyrFor=null;renderNP();}
+}
+function asRenderSettings(){
+  if(!AS_ST)return;
+  const st=$('#asStat'),sel=$('#cfgAsModel');
+  if(document.activeElement!==sel)sel.value=AS_ST.model;
+  sel.disabled=!AS_ST.available;$('#btnAsAll').disabled=!AS_ST.available;
+  const live=AS_ST.jobs.filter(j=>/queued|loading|running/.test(j.state));
+  if(!AS_ST.available){st.textContent=AS_ST.reason;st.className='dstat bad';}
+  else if(AS_ST.downloading){const d=AS_ST.downloading;st.textContent='Downloading the '+(AS_NAMES[d.name]||d.name)+' model… '+
+    (d.total?Math.min(99,Math.round(d.done/d.total*100))+'%':'');st.className='dstat';}
+  else{st.textContent=AS_ST.ready[AS_ST.model]?'Model ready':'The model downloads the first time you auto-sync a song';st.className='dstat'+(AS_ST.ready[AS_ST.model]?' ok':'');}
+  $('#btnAsStop').style.display=live.length?'':'none';
+  const box=$('#asJobs');box.innerHTML='';
+  const done=AS_ST.jobs.filter(j=>j.autosave);
+  if(!done.length&&!live.length)return;
+  const saved=done.filter(j=>j.saved).length,rev=done.filter(j=>j.state==='done'&&!j.saved);
+  box.appendChild(el('div','','<span><b>'+saved+' saved</b>'+(rev.length?' · '+rev.length+' to check':'')+(live.length?' · '+live.length+' to go':'')+'</span>'));
+  AS_ST.jobs.filter(j=>j.autosave).forEach(j=>{
+    let right;
+    if(/queued|loading|running/.test(j.state))right='<span>'+esc(asLabel(j))+'</span>';
+    else if(j.state==='error')right='<span style="color:var(--warn)">'+esc(j.error)+'</span>';
+    else if(j.state==='cancelled')right='<span>stopped</span>';
+    else if(j.saved)right='<span style="color:#3ddc84">saved · '+Math.round((j.confidence||0)*100)+'% sure</span>';
+    else right='<span class="rv">Check'+(j.confidence!=null?' · '+Math.round(j.confidence*100)+'% sure':'')+'</span>';
+    const r=el('div','','<span>'+esc(j.title)+'</span>'+right);
+    const rv=r.querySelector('.rv');if(rv)rv.onclick=()=>{showView('songs');syncEditor(j.track_id,j.result);};
+    box.appendChild(r);
+  });
+}
+$('#cfgAsModel').onchange=async e=>{await saveCfg({autosync_model:e.target.value});asRefresh();};
+$('#btnAsAll').onclick=async()=>{
+  if(AS_OK===null)await asRefresh();
+  const m=AS_ST.model;
+  if(!AS_ST.ready[m]&&!confirm('This downloads the '+(AS_NAMES[m]||m)+' speech model first (about '+Math.round(AS_ST.sizes[m]/1e6)+' MB), then works through your songs in the background. It can take a while — about as long as the songs, or quicker on a fast PC.\n\nStart?'))return;
+  let r;try{r=await post('/api/autosync/all',{});}catch(e){toast(e.message,true);return;}
+  toast(r.queued?'Auto-syncing '+r.queued+' song'+(r.queued>1?'s':'')+' in the background':'Every song with lyrics already has timings',!r.queued);
+  asRefresh();
+};
+$('#btnAsStop').onclick=async()=>{await post('/api/autosync/cancel',{});asRefresh();};
 
 /* tap-to-sync: play the song and tap as each line starts */
 const TAP_LEAD=0.15;   // people tap a little after a line starts
-async function syncEditor(id){
-  const d=await lyricsData(id,true);
+async function syncEditor(id,preset){
+  const d=preset?{lyrics:preset.lyrics}:await lyricsData(id,true);
+  if(document.querySelector('.modal.sync'))return;
   const words=(d.lyrics||'').split('\n').map(x=>x.trim()).filter(Boolean);
-  if(!words.length){toast('Add the lyrics first, then sync them',true);return;}
+  if(!words.length&&!preset){toast('Add the lyrics first, then sync them',true);return;}
   const old=(d.synced||[]).filter(x=>x.text);
-  const lines=words.map((text,i)=>{const o=old.find(x=>x.text===text&&!x._used);if(o)o._used=1;return {text,t:o?o.t:null};});
+  const lines=preset?preset.lines.filter(x=>x.text).map(x=>({text:x.text,t:x.t,guess:!!x.guessed}))
+    :words.map((text,i)=>{const o=old.find(x=>x.text===text&&!x._used);if(o)o._used=1;return {text,t:o?o.t:null};});
+  if(!lines.length){toast('Nothing to sync',true);return;}
   if(NOW!==id)playList([id],id);
   closeNP();
-  let next=lines.findIndex(x=>x.t==null);if(next<0)next=lines.length;
+  let next=preset?lines.findIndex(x=>x.guess):lines.findIndex(x=>x.t==null);if(next<0)next=preset?0:lines.length;
   const t=meta(id);
   const w=el('div','modal sync');
-  w.innerHTML='<div class="box" style="max-width:720px;height:88vh"><div class="h">Sync lyrics — '+esc(ttl(t))+'</div>'+
+  w.innerHTML='<div class="box" style="max-width:720px;height:88vh"><div class="h">'+(preset?'Check auto-sync — ':'Sync lyrics — ')+esc(ttl(t))+'</div>'+
     '<div class="synctop"><button class="btn" id="syPlay"></button><button class="btn" id="syBack" title="Back 5 seconds (←)">−5s</button>'+
     '<button class="btn" id="syFwd" title="Forward 5 seconds (→)">+5s</button><span class="tm" id="syTime" style="width:auto">0:00</span>'+
     '<div class="sp"></div><button class="btn" id="syUndo" title="Undo last tap (Backspace)">Undo</button>'+
     '<button class="btn primary tapbtn" id="syTap">Tap — line starts</button></div>'+
+    (preset?'<div class="synchint"><b>AURA timed these by listening.</b> Play it through and watch the highlight. Lines marked <b style="color:var(--warn)">check</b> '+
+      'were hard to hear — their times are a guess. To fix a line, click its time and tap from there, or nudge it with −/+.</div>':'')+
     '<div class="synchint">Press <kbd>Space</kbd> (or the Tap button) right as each highlighted line starts. <kbd>Backspace</kbd> undoes a tap. '+
     'Click a time to jump there and re-tap from that line. <b>−</b>/<b>+</b> nudge a line by a tenth of a second.</div>'+
     '<div class="b" id="syList" style="flex:1"></div><div class="f"><span class="count" id="syCount" style="margin-right:auto"></span>'+
@@ -2342,23 +2537,23 @@ async function syncEditor(id){
     const L=$('#syList');L.innerHTML='';
     let live=-1;lines.forEach((x,i)=>{if(x.t!=null&&x.t<=audio.currentTime)live=i;});
     lines.forEach((x,i)=>{
-      const r=el('div','sline'+(x.t!=null?' done':'')+(i===next?' next':'')+(i===live&&NOW===id?' live':''));
+      const r=el('div','sline'+(x.t!=null?' done':'')+(x.guess?' guess':'')+(i===next?' next':'')+(i===live&&NOW===id?' live':''));
       const tt=el('span','tt2',fmt(x.t));tt.title='Jump here and re-tap from this line';
       tt.onclick=()=>{next=i;if(x.t!=null)audio.currentTime=Math.max(0,x.t-1.5);else if(i>0&&lines[i-1].t!=null)audio.currentTime=Math.max(0,lines[i-1].t);draw();};
       const mi=el('button','ib sm','−'),pl=el('button','ib sm','+');
-      mi.onclick=()=>{if(x.t!=null){x.t=Math.max(0,+(x.t-0.1).toFixed(2));draw();}};
-      pl.onclick=()=>{if(x.t!=null){x.t=+(x.t+0.1).toFixed(2);draw();}};
+      mi.onclick=()=>{if(x.t!=null){x.t=Math.max(0,+(x.t-0.1).toFixed(2));x.guess=false;draw();}};
+      pl.onclick=()=>{if(x.t!=null){x.t=+(x.t+0.1).toFixed(2);x.guess=false;draw();}};
       r.appendChild(tt);r.appendChild(el('span','tx',esc(x.text)));r.appendChild(mi);r.appendChild(pl);L.appendChild(r);
       if(i===next&&scroll!==false)setTimeout(()=>r.scrollIntoView({block:'center'}),0);
     });
-    const n=lines.filter(x=>x.t!=null).length;
-    $('#syCount').textContent=n+' of '+lines.length+' lines timed';
+    const n=lines.filter(x=>x.t!=null).length,g=lines.filter(x=>x.guess).length;
+    $('#syCount').textContent=n+' of '+lines.length+' lines timed'+(g?' · '+g+' to check':'');
     $('#syPlay').textContent=audio.paused?'▶ Play':'❚❚ Pause';
   }
   function tap(){
     if(next>=lines.length){toast('All lines are timed — Save when you\'re happy');return;}
     if(audio.paused)audio.play().catch(()=>{});
-    lines[next].t=+Math.max(0,audio.currentTime-TAP_LEAD).toFixed(2);
+    lines[next].t=+Math.max(0,audio.currentTime-TAP_LEAD).toFixed(2);lines[next].guess=false;
     for(let j=next+1;j<lines.length;j++)if(lines[j].t!=null&&lines[j].t<lines[next].t)lines[j].t=null;
     next++;draw();
   }
@@ -2391,7 +2586,8 @@ async function syncEditor(id){
     const timed=lines.filter(x=>x.t!=null);
     if(!timed.length){toast('Tap at least one line first',true);return;}
     if(timed.length<lines.length&&!confirm((lines.length-timed.length)+' lines have no time yet and won\'t move with the song. Save anyway?'))return;
-    try{await post('/api/lyrics/'+id,{lyrics:d.lyrics,synced:timed.map(x=>({t:x.t,text:x.text}))});}catch(e){toast(e.message,true);return;}
+    const text=preset?lines.map(x=>x.text).join('\n'):d.lyrics;
+    try{await post('/api/lyrics/'+id,{lyrics:preset&&preset.lyrics?preset.lyrics:text,synced:timed.map(x=>({t:x.t,text:x.text}))});}catch(e){toast(e.message,true);return;}
     close();LYR.delete(id);markLyrics(id,true,true);toast('Synced lyrics saved — they\'ll follow the song');
     openNP('lyrics');$('#npBody')._lyrFor=null;renderNP();
   };
@@ -2558,12 +2754,18 @@ async function discordNow(){
 }
 function syncDiscordUI(){
   $('#cfgDiscord').checked=!!CFG.discord;$('#cfgDiscordId').value=CFG.discord_client_id||'';
+  $('#cfgDiscArt').checked=CFG.discord_art_lookup!==false;$('#cfgDiscUp').checked=!!CFG.discord_art_upload;
   if(!CFG.discord){$('#discordStat').textContent='';}
 }
 $('#cfgDiscord').onchange=async e=>{await saveCfg({discord:e.target.checked});
   if(e.target.checked&&!CFG.discord_client_id){$('#discordStat').textContent='Add your Application ID below to finish';$('#discordStat').className='dstat bad';return;}
   if(!e.target.checked){try{await post('/api/discord',{});}catch(x){} $('#discordStat').textContent='Off';$('#discordStat').className='dstat';return;}
   discordNow();};
+$('#cfgDiscArt').onchange=async e=>{await saveCfg({discord_art_lookup:e.target.checked});discordNow();};
+$('#cfgDiscUp').onchange=async e=>{
+  if(e.target.checked&&!confirm('Upload covers to a public image host?\n\nWhen a song that isn\'t found online plays, its artwork is uploaded once to catbox.moe so Discord can show it. Anyone who has the link can see that image.'))
+    {e.target.checked=false;return;}
+  await saveCfg({discord_art_upload:e.target.checked});discordNow();};
 $('#cfgDiscordId').onchange=async e=>{const v=e.target.value.replace(/\D/g,'');e.target.value=v;await saveCfg({discord_client_id:v});discordNow();};
 
 /* ---------- sound settings ---------- */
@@ -2887,7 +3089,7 @@ window.onbeforeunload=()=>DIRTY?'Unsaved changes':undefined;
 (async function(){
   try{await loadState();await loadConfig();await load();renderEditor();await refreshUndo();loadVersions();
     await loadPlayer();showView('songs');restoreQueue();READY=true;watchLibrary();
-    applySpeed();renderEqUI();levelNote();initVersion();discordSoon();
+    applySpeed();renderEqUI();levelNote();initVersion();discordSoon();asRefresh();
     const s=await api('/api/scan/status');if(s.running)poll();
   }catch(e){toast('Could not reach the backend: '+e.message,true);}
 })();
