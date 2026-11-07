@@ -103,6 +103,19 @@ but no timings** works through your whole library in the background: songs it's
 confident about are saved straight away, the rest are listed with a **Check**
 link. With **Better**, expect around a minute per song on a typical PC.
 
+**Full-screen lyrics.** **Full screen** in the lyrics bar (or `K`) shows the
+lyrics karaoke-style: the current line huge, the next lines coming up, the
+cover blurred behind. Click a line to jump there; `Esc` closes it.
+
+**Waveform and A–B loop.** The Now Playing seek bar shows the song's shape
+(worked out once per song). **A–B** loops part of a song: press it at the start
+of the part, again at the end, again to stop — or use `[` and `]`, and `\` to
+stop. While a loop is on, an **A–B** chip shows on the player bar.
+
+**History.** Now Playing and the Up next drawer have a **History** tab with the
+last 100 songs you played. Click one to play it now; your queue carries on
+after it.
+
 **Lyrics search.** Type a line you remember into the Songs search; songs whose
 lyrics contain it show up with the matching line.
 
@@ -237,11 +250,51 @@ it leaves deliberate styling alone (an ALLCAPS or all-lowercase title keeps its
 look only if the name is genuinely mixed case), and it won't strip a leading
 number that's part of the title, so `21 Guns` and `99 Problems` survive.
 
-By default it only fills fields that are **empty**. Tick *Overwrite* to replace
-what's already there.
+**More from the name and folder** (each is a tick box):
+- **Artist** from `Artist - Title` names (`Juice WRLD - Cigarettes.flac` → artist
+  *Juice WRLD*, title *Cigarettes*).
+- **Track numbers** from a leading `01 -`.
+- **Labels** like `CDQ`, `HQ`, `LQ`, `Snippet`, `Leak`, `OG`, `Session`,
+  `Instrumental` go into *Your tags*, so you can search `tag:cdq`.
+- **Folder name → Era or Album**: songs in `Music\Goodbye Era\` get the era
+  *Goodbye Era*. Songs sitting directly in your main music folder are skipped.
 
-Nothing is written until you've seen the preview. Untick any row you disagree
-with, then **Write tags**.
+By default it only fills fields that are **empty**. Tick *Overwrite* to replace
+what's already there. To run it on just some songs: in Library tick them and
+press **Auto-tag…**.
+
+Nothing is written until you've seen the preview. Untick a song, or click a
+single change to leave just that one out, then **Write tags**.
+
+## Missing info
+
+Organize → **Missing info** counts what's still missing across the library: no
+cover, artist, title tag, album, year, era, lyrics, timed lyrics, rating, or
+not an MP3. **Show songs** opens them in Library (filtered with words like
+`noart`, `noartist`, `noera`, `nolyrics`, `nosync`, `notmp3` — you can type
+those yourself too), and the quick buttons fix them: **Find covers** walks you
+through the songs without a cover one by one, **Auto-tag**, **Auto-sync all**,
+**Convert**.
+
+## Eras
+
+An **Era** field groups songs by era or session (*Goodbye & Good Riddance*,
+*Posthumous*, *2018 sessions*…). Set it in a song's **Era** box, on many songs
+with **Set era…** in Library, or from folder names with Auto-tag. **Listen →
+Eras** shows each era like an album, ordered by year; open one to play it,
+shuffle it, save it as a playlist or rename it. In MP3s the era is saved in
+the file (an `ERA` tag); for other formats it lives in AURA's library.
+
+## Cover art
+
+**Find cover…** (in a song's editor, the `⋯` menu on any song, or for many
+songs at once in Library) has three tabs:
+- **Search online** — covers from Apple Music and Deezer. Click one, then
+  **Use this cover** (double-click works too).
+- **Make one** — for unreleased songs with no official art: five styles
+  (Glow, Grain, Bold, Minimal, Split), your colour, your text. Made on your PC.
+- **From a file…** — any picture you have.
+Covers are saved inside the file for MP3, WAV, AIFF, FLAC, M4A, OGG and OPUS.
 
 ---
 
@@ -368,6 +421,7 @@ Press `?` in the app for the full list.
 `Space` play / pause · `Ctrl`+`→` / `←` next / previous · `Shift`+`→` / `←`
 skip 10 seconds · `N` Now Playing · `L` lyrics · `Q` Up next · `M` mini player ·
 `Space` (in the sync window) time the next line ·
+`K` full-screen lyrics · `[` `]` loop start / end · `\` stop the loop ·
 `F` favorite · `/` search · `Esc` close a panel · `Ctrl`+`S` save tags ·
 `Ctrl`+`Z` undo · `↑` `↓` move through the Organize list
 
