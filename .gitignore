@@ -1,0 +1,10 @@
+# build output
+build/
+dist/
+.buildenv/
+*.spec
+__pycache__/
+# your own library (lives in %APPDATA%\Unreleased when installed)
+library.db*
+config.json
+selftest.txt

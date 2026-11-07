@@ -1,0 +1,3070 @@
+"""
+AURA — a music player and local library editor (formerly Unreleased).
+
+Runs entirely on your own machine. Scans folders you point it at, caches
+everything in a small database, lets you edit tags one track at a time, fills
+in metadata in bulk, and finds duplicates four different ways.
+"""
+
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import struct
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
+from pathlib import Path
+
+from flask import Flask, Response, abort, jsonify, request, send_file
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    import soundfile as _sf
+except Exception:
+    _sf = None
+
+from mutagen import File as MutagenFile
+from mutagen.id3 import (ID3, ID3NoHeaderError, APIC, TIT2, TPE1, TPE2, TALB,
+                         TDRC, TCON, TRCK, TBPM, TKEY, COMM, TXXX, USLT, SYLT)
+
+# The data folder keeps its old name so an existing library, ratings, versions
+# and settings carry straight over to AURA.
+APP_NAME = "Unreleased"
+FROZEN = getattr(sys, "frozen", False)
+
+
+def resource_dir():
+    if FROZEN:
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+def data_dir():
+    if FROZEN:
+        base = (os.environ.get("APPDATA") or os.environ.get("XDG_DATA_HOME")
+                or str(Path.home() / ".local" / "share"))
+        d = Path(base) / APP_NAME
+    else:
+        d = Path(__file__).resolve().parent
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+DATA_DIR = data_dir()
+DB_PATH = DATA_DIR / "library.db"
+CONFIG_PATH = DATA_DIR / "config.json"
+
+AUDIO_EXT = {".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif", ".ogg", ".opus", ".wma"}
+
+FP_BANDS, FP_SLICES = 32, 128
+FP_BITS = (FP_SLICES - 1) * (FP_BANDS - 1)
+
+# Fields the editor and the bulk tools can write.
+TAG_FIELDS = ["title", "artist", "albumartist", "album", "year", "genre",
+              "track_no", "bpm", "music_key", "producer", "comment",
+              "notes", "user_tags"]
+
+app = Flask(__name__)
+TOKEN = secrets.token_urlsafe(24)
+ALLOWED_ORIGINS = set()
+
+SCAN_STATE = {"running": False, "done": 0, "total": 0, "message": "", "finished_at": 0}
+FFMPEG = shutil.which("ffmpeg")
+CAN_FINGERPRINT = np is not None and (_sf is not None or FFMPEG is not None)
+
+
+@app.before_request
+def guard():
+    if not request.path.startswith("/api/"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        abort(403)
+    if request.method != "GET" and request.headers.get("X-Token") != TOKEN:
+        abort(403)
+    return None
+
+
+# --------------------------------------------------------------------------
+# storage
+# --------------------------------------------------------------------------
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tracks (
+    id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, filename TEXT,
+    folder TEXT, ext TEXT, size INTEGER, mtime REAL, duration REAL,
+    bitrate INTEGER, samplerate INTEGER, file_hash TEXT, audio_hash TEXT,
+    fingerprint BLOB, title TEXT, artist TEXT, album TEXT, albumartist TEXT,
+    year TEXT, genre TEXT, track_no TEXT, bpm TEXT, music_key TEXT,
+    producer TEXT DEFAULT '', comment TEXT, has_art INTEGER DEFAULT 0,
+    rating INTEGER DEFAULT 0, notes TEXT DEFAULT '', user_tags TEXT DEFAULT '',
+    missing INTEGER DEFAULT 0, first_seen REAL, last_scan REAL
+);
+CREATE INDEX IF NOT EXISTS idx_file_hash  ON tracks(file_hash);
+CREATE INDEX IF NOT EXISTS idx_audio_hash ON tracks(audio_hash);
+
+CREATE TABLE IF NOT EXISTS undo_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, label TEXT, n INTEGER
+);
+CREATE TABLE IF NOT EXISTS undo_items (
+    batch_id INTEGER, track_id INTEGER, field TEXT, old_value TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_undo ON undo_items(batch_id);
+
+-- Which tracks are versions of the same song. status is 'grouped' (a member
+-- of `song`) or 'ignored' (the user said "not a version", so it is never
+-- suggested again).
+CREATE TABLE IF NOT EXISTS versions (
+    track_id INTEGER PRIMARY KEY, song TEXT DEFAULT '', label TEXT DEFAULT '',
+    status TEXT DEFAULT 'grouped'
+);
+CREATE INDEX IF NOT EXISTS idx_versions_song ON versions(song COLLATE NOCASE);
+
+-- Player: hearted songs and your own playlists. Kept in the app's library,
+-- never written into the music files.
+CREATE TABLE IF NOT EXISTS favorites (
+    track_id INTEGER PRIMARY KEY, added REAL
+);
+CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL, created REAL, updated REAL
+);
+CREATE TABLE IF NOT EXISTS playlist_items (
+    playlist_id INTEGER NOT NULL, track_id INTEGER NOT NULL, pos INTEGER NOT NULL,
+    PRIMARY KEY (playlist_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pl_items ON playlist_items(playlist_id, pos);
+
+-- How often and how recently each song was played (for Most / Recently played).
+CREATE TABLE IF NOT EXISTS plays (
+    track_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0, last_played REAL
+);
+-- Every listen, for the Stats page: how many seconds of which song, when.
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY, track_id INTEGER, ts REAL, seconds REAL
+);
+CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts);
+-- Small key/value store: the player's saved state (resume, queue, settings).
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY, value TEXT
+);
+"""
+
+DEFAULT_CONFIG = {
+    "folders": [],
+    "quarantine": "",
+    "rename_pattern": "{title}",
+    "write_tags_to_file": True,
+    "fingerprint": True,
+    # Rescan by itself when files are added, changed or removed in the folders.
+    "watch_folders": True,
+    # Discord "Listening to" status. The Application ID comes from a free app at
+    # discord.com/developers/applications — see README → Discord status.
+    "discord": False,
+    "discord_client_id": "",
+    # Values stamped onto every track by the auto-fill tool.
+    "defaults": {"artist": "", "albumartist": "", "album": "", "genre": "", "year": ""},
+}
+
+
+def init_db():
+    with db() as conn:
+        conn.executescript(SCHEMA)
+        # migrate older databases forward without losing anything
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(tracks)")}
+        for col, decl in [("producer", "TEXT DEFAULT ''"),
+                          ("user_tags", "TEXT DEFAULT ''"),
+                          ("notes", "TEXT DEFAULT ''"),
+                          ("rating", "INTEGER DEFAULT 0"),
+                          ("lyrics", "TEXT DEFAULT ''"),
+                          ("has_synced", "INTEGER DEFAULT 0"),
+                          ("gain_db", "REAL")]:
+            if col not in have:
+                conn.execute("ALTER TABLE tracks ADD COLUMN %s %s" % (col, decl))
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG_PATH.exists():
+        try:
+            stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            d = stored.pop("defaults", None)
+            cfg.update(stored)
+            if isinstance(d, dict):
+                cfg["defaults"].update({k: v for k, v in d.items()
+                                        if k in cfg["defaults"]})
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def quarantine_dir(cfg=None):
+    cfg = cfg or load_config()
+    q = (cfg.get("quarantine") or "").strip()
+    if q:
+        return Path(q)
+    folders = cfg.get("folders") or []
+    return Path(folders[0]) / "_duplicates" if folders else None
+
+
+# --------------------------------------------------------------------------
+# undo
+# --------------------------------------------------------------------------
+
+def record_undo(conn, label, changes):
+    """changes: {track_id: {field: old_value}}. Returns the batch id."""
+    if not changes:
+        return None
+    cur = conn.execute("INSERT INTO undo_batches (ts, label, n) VALUES (?,?,?)",
+                       (time.time(), label, len(changes)))
+    batch = cur.lastrowid
+    rows = [(batch, tid, f, "" if v is None else str(v))
+            for tid, fields in changes.items() for f, v in fields.items()]
+    conn.executemany(
+        "INSERT INTO undo_items (batch_id, track_id, field, old_value) VALUES (?,?,?,?)",
+        rows)
+    # keep the last 20 batches only
+    old = [r["id"] for r in conn.execute(
+        "SELECT id FROM undo_batches ORDER BY id DESC LIMIT -1 OFFSET 20")]
+    if old:
+        marks = ",".join("?" for _ in old)
+        conn.execute("DELETE FROM undo_items WHERE batch_id IN (%s)" % marks, old)
+        conn.execute("DELETE FROM undo_batches WHERE id IN (%s)" % marks, old)
+    return batch
+
+
+# --------------------------------------------------------------------------
+# hashing / fingerprinting
+# --------------------------------------------------------------------------
+
+def file_sha256(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def audio_stream_hash(path):
+    """Hash only the audio payload, skipping ID3v2 at the head and ID3v1 at the
+    tail, so a file you retagged still matches its untouched twin."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            start = 0
+            head = f.read(10)
+            if head[:3] == b"ID3":
+                flags = head[5]
+                tag_size = 0
+                for b in head[6:10]:
+                    tag_size = (tag_size << 7) | (b & 0x7F)
+                start = 10 + tag_size + (10 if flags & 0x10 else 0)
+            end = size
+            if size > 128:
+                f.seek(size - 128)
+                if f.read(3) == b"TAG":
+                    end = size - 128
+            if end <= start:
+                return None
+            f.seek(start)
+            h = hashlib.md5()
+            remaining = end - start
+            while remaining > 0:
+                b = f.read(min(1 << 20, remaining))
+                if not b:
+                    break
+                remaining -= len(b)
+                h.update(b)
+            return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _resample(x, sr, target_sr):
+    if np is None or x is None or len(x) < 2:
+        return None
+    if sr == target_sr:
+        return x.astype(np.float32)
+    n_out = int(len(x) * target_sr / float(sr))
+    if n_out < 2:
+        return None
+    return np.interp(np.linspace(0.0, len(x) - 1.0, n_out),
+                     np.arange(len(x), dtype=np.float64), x).astype(np.float32)
+
+
+def decode_mono(path, target_sr=11025, max_seconds=420):
+    if np is None:
+        return None
+    if _sf is not None:
+        try:
+            with _sf.SoundFile(str(path)) as f:
+                sr = f.samplerate
+                data = f.read(frames=int(sr * max_seconds), dtype="float32",
+                              always_2d=True)
+            if data.size:
+                return _resample(data.mean(axis=1), sr, target_sr)
+        except Exception:
+            pass
+    if FFMPEG:
+        try:
+            proc = subprocess.run(
+                [FFMPEG, "-v", "quiet", "-i", str(path), "-map", "0:a:0",
+                 "-ac", "1", "-ar", str(target_sr), "-t", str(max_seconds),
+                 "-f", "s16le", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=180,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
+            if len(proc.stdout) >= target_sr * 2 * 3:
+                return np.frombuffer(proc.stdout, dtype="<i2").astype(np.float32) / 32768.0
+        except Exception:
+            pass
+    return None
+
+
+def fingerprint(path):
+    """Haitsma-Kalker style sub-fingerprint: per time slice and frequency band,
+    one bit for whether the energy difference between neighbouring bands rose or
+    fell. Survives re-encoding, so two renders of one song match while unrelated
+    songs sit near a 50% bit difference."""
+    if np is None:
+        return None
+    x = decode_mono(path)
+    if x is None or len(x) < 11025 * 3:
+        return None
+    try:
+        n, hop = 2048, 512
+        frames = 1 + (len(x) - n) // hop
+        if frames < FP_SLICES:
+            return None
+        win = np.hanning(n).astype(np.float32)
+        edges = np.unique(np.geomspace(6, n // 2, FP_BANDS + 1).astype(int))
+        if len(edges) < FP_BANDS + 1:
+            edges = np.linspace(6, n // 2, FP_BANDS + 1).astype(int)
+        bands = np.empty((frames, FP_BANDS), dtype=np.float32)
+        for s in range(0, frames, 512):
+            e = min(s + 512, frames)
+            idx = np.arange(n)[None, :] + hop * np.arange(s, e)[:, None]
+            spec = np.abs(np.fft.rfft(x[idx] * win, axis=1))
+            for i in range(FP_BANDS):
+                lo, hi = edges[i], max(edges[i + 1], edges[i] + 1)
+                bands[s:e, i] = spec[:, lo:hi].mean(axis=1)
+        bands = np.log(bands + 1e-9)
+        cuts = np.linspace(0, frames, FP_SLICES + 1).astype(int)
+        energy = np.stack([bands[cuts[i]:max(cuts[i + 1], cuts[i] + 1)].mean(axis=0)
+                           for i in range(FP_SLICES)])
+        dd = np.diff(np.diff(energy, axis=1), axis=0)
+        return np.packbits((dd > 0).astype(np.uint8).ravel()).tobytes()
+    except Exception:
+        return None
+
+
+def fp_similarity(a, b):
+    if np is None or not a or not b or len(a) != len(b):
+        return 0.0
+    ba = np.unpackbits(np.frombuffer(a, dtype=np.uint8))[:FP_BITS]
+    bb = np.unpackbits(np.frombuffer(b, dtype=np.uint8))[:FP_BITS]
+    if ba.size == 0:
+        return 0.0
+    return 1.0 - float(np.count_nonzero(ba != bb)) / ba.size
+
+
+# --------------------------------------------------------------------------
+# tags
+# --------------------------------------------------------------------------
+
+def _txt(frames):
+    return str(frames[0]).strip() if frames else ""
+
+
+def read_tags(path):
+    out = {k: "" for k in TAG_FIELDS}
+    out.update({"has_art": 0, "rating": 0, "duration": 0.0,
+                "bitrate": 0, "samplerate": 0})
+    try:
+        mf = MutagenFile(path)
+    except Exception:
+        return out
+    if mf is None:
+        return out
+
+    info = getattr(mf, "info", None)
+    if info is not None:
+        out["duration"] = float(getattr(info, "length", 0) or 0)
+        out["bitrate"] = int(getattr(info, "bitrate", 0) or 0)
+        out["samplerate"] = int(getattr(info, "sample_rate", 0) or 0)
+
+    tags = mf.tags
+    if tags is None:
+        return out
+
+    if isinstance(tags, ID3):
+        out["title"] = _txt(tags.getall("TIT2"))
+        out["artist"] = _txt(tags.getall("TPE1"))
+        out["album"] = _txt(tags.getall("TALB"))
+        out["albumartist"] = _txt(tags.getall("TPE2"))
+        out["year"] = _txt(tags.getall("TDRC")) or _txt(tags.getall("TYER"))
+        out["genre"] = _txt(tags.getall("TCON"))
+        out["track_no"] = _txt(tags.getall("TRCK"))
+        out["bpm"] = _txt(tags.getall("TBPM"))
+        out["music_key"] = _txt(tags.getall("TKEY"))
+        comments = tags.getall("COMM")
+        out["comment"] = str(comments[0].text[0]).strip() if comments and comments[0].text else ""
+        out["has_art"] = 1 if tags.getall("APIC") else 0
+        for fr in tags.getall("TXXX"):
+            desc = (fr.desc or "").upper()
+            val = str(fr.text[0]).strip() if fr.text else ""
+            if desc == "UNRELEASED_RATING":
+                try:
+                    out["rating"] = int(val)
+                except ValueError:
+                    pass
+            elif desc == "UNRELEASED_NOTES":
+                out["notes"] = val
+            elif desc == "UNRELEASED_TAGS":
+                out["user_tags"] = val
+            elif desc in ("PRODUCER", "UNRELEASED_PRODUCER"):
+                out["producer"] = val
+    else:
+        def g(*keys):
+            for k in keys:
+                try:
+                    v = tags.get(k)
+                except (ValueError, KeyError, TypeError):
+                    v = None
+                if v:
+                    return str(v[0]).strip() if isinstance(v, list) else str(v).strip()
+            return ""
+        out["title"] = g("title", "\xa9nam")
+        out["artist"] = g("artist", "\xa9ART")
+        out["album"] = g("album", "\xa9alb")
+        out["albumartist"] = g("albumartist", "aART")
+        out["year"] = g("date", "\xa9day")
+        out["genre"] = g("genre", "\xa9gen")
+        out["track_no"] = g("tracknumber")
+        out["bpm"] = g("bpm", "tmpo")
+        out["comment"] = g("comment", "\xa9cmt")
+        try:
+            covr = tags.get("covr")
+        except (ValueError, KeyError, TypeError):
+            covr = None
+        out["has_art"] = 1 if (covr or getattr(mf, "pictures", None)) else 0
+    return out
+
+
+def write_tags(path, data, write_extras=True):
+    p = Path(path)
+    if p.suffix.lower() == ".mp3":
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        def setf(cls, value):
+            tags.delall(cls.__name__)
+            if value:
+                tags.add(cls(encoding=3, text=[str(value)]))
+
+        setf(TIT2, data.get("title", ""))
+        setf(TPE1, data.get("artist", ""))
+        setf(TALB, data.get("album", ""))
+        setf(TPE2, data.get("albumartist", ""))
+        setf(TDRC, data.get("year", ""))
+        setf(TCON, data.get("genre", ""))
+        setf(TRCK, data.get("track_no", ""))
+        setf(TBPM, data.get("bpm", ""))
+        setf(TKEY, data.get("music_key", ""))
+
+        tags.delall("COMM")
+        if data.get("comment"):
+            tags.add(COMM(encoding=3, lang="eng", desc="", text=[data["comment"]]))
+
+        if write_extras:
+            wanted = {"UNRELEASED_RATING": str(data.get("rating", 0) or ""),
+                      "UNRELEASED_NOTES": data.get("notes", ""),
+                      "UNRELEASED_TAGS": data.get("user_tags", ""),
+                      "PRODUCER": data.get("producer", "")}
+            for fr in list(tags.getall("TXXX")):
+                if (fr.desc or "").upper() in wanted or (fr.desc or "").upper() == "UNRELEASED_STATUS":
+                    tags.delall("TXXX:%s" % fr.desc)
+            for desc, val in wanted.items():
+                if val:
+                    tags.add(TXXX(encoding=3, desc=desc, text=[val]))
+        tags.save(path, v2_version=3)
+        return True
+
+    mf = MutagenFile(path, easy=True)
+    if mf is None:
+        return False
+    if mf.tags is None:
+        try:
+            mf.add_tags()
+        except Exception:
+            return False
+    for src, dst in {"title": "title", "artist": "artist", "album": "album",
+                     "albumartist": "albumartist", "year": "date",
+                     "genre": "genre", "track_no": "tracknumber",
+                     "bpm": "bpm"}.items():
+        val = data.get(src, "")
+        try:
+            if val:
+                mf[dst] = [str(val)]
+            elif dst in mf:
+                del mf[dst]
+        except Exception:
+            pass
+    mf.save()
+    return True
+
+
+def set_artwork(path, image_bytes, mime):
+    if Path(path).suffix.lower() != ".mp3":
+        return False
+    try:
+        tags = ID3(path)
+    except ID3NoHeaderError:
+        tags = ID3()
+    tags.delall("APIC")
+    if image_bytes:
+        tags.add(APIC(encoding=3, mime=mime or "image/jpeg", type=3,
+                      desc="Cover", data=image_bytes))
+    tags.save(path, v2_version=3)
+    return True
+
+
+def get_artwork(path):
+    try:
+        mf = MutagenFile(path)
+    except Exception:
+        return None, None
+    if mf is None:
+        return None, None
+    tags = mf.tags
+    if isinstance(tags, ID3):
+        pics = tags.getall("APIC")
+        if pics:
+            return pics[0].data, pics[0].mime or "image/jpeg"
+    if getattr(mf, "pictures", None):
+        pic = mf.pictures[0]
+        return pic.data, pic.mime or "image/jpeg"
+    if tags and "covr" in tags:
+        return bytes(tags["covr"][0]), "image/jpeg"
+    return None, None
+
+
+# --------------------------------------------------------------------------
+# filename parsing
+# --------------------------------------------------------------------------
+
+SMALL_WORDS = {"a", "an", "and", "as", "at", "but", "by", "для", "for", "from",
+               "in", "into", "nor", "of", "on", "onto", "or", "over", "the",
+               "to", "up", "vs", "with"}
+BITRATES = {"128", "160", "192", "224", "256", "320"}
+QUALITY = re.compile(r"\b(cdq|hq|lq|full|lossless|\d{2,3}\s?kbps|mp3|wav|master(?:ed)?ing)\b",
+                     re.I)
+FEAT_RE = re.compile(r"[\(\[\{]?\s*(?:feat|ft|featuring|w/|with)\.?\s+([^\)\]\}\[\(]+)[\)\]\}]?",
+                     re.I)
+PROD_RE = re.compile(r"[\(\[\{]?\s*prod(?:uced)?\.?\s*(?:by)?\s*[:\-]?\s*([^\)\]\}\[\(]+)[\)\]\}]?",
+                     re.I)
+
+
+def smart_title(s):
+    """Title-case only when the original carries no capitalisation intent, so
+    deliberate styling like ALLCAPS or lowercase-as-aesthetic survives."""
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return s
+    mixed = any(c.isupper() for c in letters) and any(c.islower() for c in letters)
+    if mixed:
+        return s
+    words = s.split()
+    out = []
+    for i, w in enumerate(words):
+        low = w.lower()
+        if i not in (0, len(words) - 1) and low in SMALL_WORDS:
+            out.append(low)
+        else:
+            out.append(low[:1].upper() + low[1:])
+    return " ".join(out)
+
+
+def parse_filename(filename, known_artist=""):
+    """Pull a clean title, features and producer out of a messy filename.
+
+    Deliberately conservative: it strips things that are certainly not part of a
+    song's name (track indexes, duplicate markers, bitrate and quality tags) and
+    lifts out feat/prod credits, but never invents information."""
+    stem = os.path.splitext(filename)[0]
+    s = stem.replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # leading track index: "01 - ", "01.", "(03)"
+    s = re.sub(r"^[\(\[]?\d{1,3}[\)\]]?\s*[-–—.)\]]\s*", "", s).strip()
+    # bare leading index with no separator ("07 track name"). Only when it is
+    # zero-padded, so titles that genuinely open with a number — "21 Guns",
+    # "99 Problems" — are left alone.
+    s = re.sub(r"^0\d{0,2}\s+(?=\S)", "", s).strip()
+    # trailing duplicate markers: " (1)", " - Copy", " copy 2"
+    s = re.sub(r"\s*[-–—]?\s*copy(\s*\d+)?$", "", s, flags=re.I)
+    s = re.sub(r"\s*\(\s*\d{1,2}\s*\)\s*$", "", s).strip()
+
+    producer = ""
+    m = PROD_RE.search(s)
+    if m:
+        producer = m.group(1).strip(" -–—_.&,")
+        s = (s[:m.start()] + " " + s[m.end():]).strip()
+
+    features = ""
+    m = FEAT_RE.search(s)
+    if m:
+        features = m.group(1).strip(" -–—_.&,")
+        s = (s[:m.start()] + " " + s[m.end():]).strip()
+
+    # quality / bitrate noise
+    s = QUALITY.sub(" ", s)
+    s = " ".join(w for w in s.split()
+                 if not (w.strip("()[]{}") in BITRATES and len(s.split()) > 1))
+
+    # "Artist - Title" where the left side is the artist we already know
+    if " - " in s and known_artist:
+        left, right = s.split(" - ", 1)
+        if SequenceMatcher(None, left.strip().lower(),
+                           known_artist.strip().lower()).ratio() > 0.85:
+            s = right.strip()
+
+    s = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", s)          # emptied brackets
+    s = re.sub(r"\s*[-–—_]+\s*$", "", s)
+    s = re.sub(r"^\s*[-–—_]+\s*", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" -–—_.")
+
+    title = smart_title(s) if s else ""
+    if features:
+        title = "%s (feat. %s)" % (title, smart_title(features)) if title else title
+    return {"title": title, "producer": smart_title(producer) if producer else ""}
+
+
+# --------------------------------------------------------------------------
+# scanning
+# --------------------------------------------------------------------------
+
+def iter_audio_files(folders, skip_dirs=()):
+    skip = {os.path.normcase(os.path.abspath(str(d))) for d in skip_dirs if d}
+    seen = set()
+    for folder in folders:
+        root = Path(folder)
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            here = os.path.normcase(os.path.abspath(dirpath))
+            if any(here == s or here.startswith(s + os.sep) for s in skip):
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")
+                           and d.lower() not in {"node_modules", "_duplicates"}]
+            for name in filenames:
+                if Path(name).suffix.lower() in AUDIO_EXT:
+                    p = str(Path(dirpath) / name)
+                    key = os.path.normcase(p)
+                    if key not in seen:
+                        seen.add(key)
+                        yield p
+
+
+def analyse(path, do_fingerprint):
+    """All the slow, per-file work. Runs on a worker thread; touches no database."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    tags = read_tags(path)
+    return {
+        "path": path, "filename": os.path.basename(path),
+        "folder": os.path.dirname(path),
+        "ext": Path(path).suffix.lower().lstrip("."),
+        "size": st.st_size, "mtime": st.st_mtime,
+        "duration": tags["duration"], "bitrate": tags["bitrate"],
+        "samplerate": tags["samplerate"],
+        "file_hash": file_sha256(path),
+        "audio_hash": audio_stream_hash(path) if path.lower().endswith(".mp3") else None,
+        "fingerprint": fingerprint(path) if do_fingerprint else None,
+        "title": tags["title"], "artist": tags["artist"], "album": tags["album"],
+        "albumartist": tags["albumartist"], "year": tags["year"],
+        "genre": tags["genre"], "track_no": tags["track_no"], "bpm": tags["bpm"],
+        "music_key": tags["music_key"], "producer": tags["producer"],
+        "comment": tags["comment"], "has_art": tags["has_art"],
+        "_rating": tags["rating"], "_notes": tags["notes"],
+        "_user_tags": tags["user_tags"],
+        "lyrics": (_lyr := read_lyrics_full(path))["plain"][:20000],
+        "has_synced": 1 if _lyr["synced"] else 0,
+        "gain_db": None,
+        "missing": 0,
+    }
+
+
+SCAN_LOCK = threading.Lock()
+
+
+def scan_library(deep=True, auto=False):
+    """Only one scan at a time; a second request while one runs is dropped."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return False
+    try:
+        SCAN_STATE["auto"] = auto
+        _scan_library(deep)
+    finally:
+        SCAN_LOCK.release()
+    return True
+
+
+def _scan_library(deep=True):
+    cfg = load_config()
+    SCAN_STATE.update(running=True, done=0, total=0, message="Listing files…")
+    try:
+        files = list(iter_audio_files(cfg.get("folders", []),
+                                      skip_dirs=[quarantine_dir(cfg)]))
+        SCAN_STATE["total"] = len(files)
+        do_fp = bool(deep and cfg.get("fingerprint", True))
+
+        conn = None
+        conn = db()
+        existing = {os.path.normcase(r["path"]): dict(r)
+                    for r in conn.execute("SELECT * FROM tracks")}
+        now = time.time()
+        alive, todo = set(), []
+
+        for path in files:
+            key = os.path.normcase(path)
+            alive.add(key)
+            prev = existing.get(key)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if (prev and prev["size"] == st.st_size
+                    and abs((prev["mtime"] or 0) - st.st_mtime) < 1
+                    and prev["file_hash"]):
+                conn.execute("UPDATE tracks SET last_scan=?, missing=0 WHERE id=?",
+                             (now, prev["id"]))
+                SCAN_STATE["done"] += 1
+            else:
+                todo.append(path)
+        conn.commit()
+
+        # The heavy part — decoding and hashing — is I/O and numpy bound, so it
+        # parallelises well and this is where nearly all the wall time goes.
+        if todo:
+            SCAN_STATE["message"] = "Reading %d new or changed files…" % len(todo)
+            workers = max(2, min(8, (os.cpu_count() or 4)))
+            lock = threading.Lock()
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                def safe_analyse(p):
+                    try:
+                        return analyse(p, do_fp)
+                    except Exception:
+                        return None
+                for row in ex.map(safe_analyse, todo):
+                    if row is None:
+                        continue
+                    with lock:
+                        SCAN_STATE["done"] += 1
+                        SCAN_STATE["message"] = row["filename"]
+                    key = os.path.normcase(row["path"])
+                    prev = existing.get(key)
+                    rating = row.pop("_rating")
+                    notes = row.pop("_notes")
+                    utags = row.pop("_user_tags")
+                    row["last_scan"] = now
+                    if prev:
+                        if row["fingerprint"] is None and prev["fingerprint"]:
+                            row["fingerprint"] = prev["fingerprint"]
+                        row["rating"] = rating or prev["rating"] or 0
+                        row["notes"] = notes or prev["notes"] or ""
+                        row["user_tags"] = utags or prev["user_tags"] or ""
+                        cols = ", ".join("%s=?" % k for k in row)
+                        conn.execute("UPDATE tracks SET %s WHERE id=?" % cols,
+                                     (*row.values(), prev["id"]))
+                    else:
+                        row["rating"] = rating or 0
+                        row["notes"] = notes or ""
+                        row["user_tags"] = utags or ""
+                        row["first_seen"] = now
+                        conn.execute(
+                            "INSERT INTO tracks (%s) VALUES (%s)" %
+                            (", ".join(row.keys()), ", ".join("?" for _ in row)),
+                            tuple(row.values()))
+                    if SCAN_STATE["done"] % 25 == 0:
+                        conn.commit()
+
+        for key, prev in existing.items():
+            if key not in alive:
+                conn.execute("UPDATE tracks SET missing=1 WHERE id=?", (prev["id"],))
+        conn.commit()
+        conn.close()
+        SCAN_STATE["message"] = "Scanned %d files." % len(files)
+    except Exception as exc:
+        SCAN_STATE["message"] = "Scan failed: %s" % (exc or type(exc).__name__)
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+    finally:
+        SCAN_STATE["running"] = False
+        SCAN_STATE["finished_at"] = time.time()
+
+
+# --------------------------------------------------------------------------
+# duplicates
+# --------------------------------------------------------------------------
+
+VERSION_WORDS = re.compile(
+    r"\b(final|finalfinal|master|mastered|mixdown|mix|remix|edit|version|ver|"
+    r"v\d+|take\d*|draft|demo|copy|new|old|rough|bounce|export|wip|"
+    r"\d{1,2}[-_]?\d{1,2}[-_]?\d{2,4})\b")
+
+
+def normalise_title(name):
+    s = unicodedata.normalize("NFKD", name).lower()
+    s = re.sub(r"\.[a-z0-9]{2,5}$", "", s)
+    s = re.sub(r"\(\s*\d+\s*\)", " ", s)
+    s = re.sub(r"[\[\](){}_\-\u2014\u2013]+", " ", s)
+    s = VERSION_WORDS.sub(" ", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+\d{2,4}\s*$", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_duplicates(fp_threshold=0.78):
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM tracks WHERE missing=0 ORDER BY id")]
+    grouped = grouped_map(conn)
+    conn.close()
+    # Tracks the user has grouped as versions of one song are different mixes
+    # on purpose. Checks 1 and 2 (byte-identical copies) still apply, but the
+    # fuzzy checks 3 and 4 must never offer to move a version out of the way.
+    for r in rows:
+        r["song"] = grouped.get(r["id"], "")
+
+    groups, claimed = [], set()
+
+    def emit(tier, label, members, confidence):
+        ids = tuple(sorted(m["id"] for m in members))
+        if len(ids) < 2 or ids in claimed:
+            return
+        claimed.add(ids)
+        groups.append({"tier": tier, "label": label, "confidence": confidence,
+                       "tracks": [public(m) for m in members]})
+
+    by_file = {}
+    for r in rows:
+        if r["file_hash"]:
+            by_file.setdefault(r["file_hash"], []).append(r)
+    for m in by_file.values():
+        emit(1, "Identical file", m, "certain")
+
+    by_audio = {}
+    for r in rows:
+        if r["audio_hash"]:
+            by_audio.setdefault(r["audio_hash"], []).append(r)
+    for m in by_audio.values():
+        emit(2, "Same audio, different tags", m, "certain")
+
+    if np is not None:
+        fps = [r for r in rows if r["fingerprint"] and r["id"] not in grouped]
+        used = set()
+        for i, a in enumerate(fps):
+            if a["id"] in used:
+                continue
+            cluster = [a]
+            for b in fps[i + 1:]:
+                if b["id"] in used:
+                    continue
+                da, dbb = a["duration"] or 0, b["duration"] or 0
+                if da and dbb and abs(da - dbb) / max(da, dbb) > 0.25:
+                    continue
+                if fp_similarity(a["fingerprint"], b["fingerprint"]) >= fp_threshold:
+                    cluster.append(b)
+            if len(cluster) > 1:
+                for m in cluster:
+                    used.add(m["id"])
+                emit(3, "Sounds like the same song", cluster, "likely")
+
+    buckets = {}
+    for r in rows:
+        if r["id"] in grouped:
+            continue
+        norm = normalise_title(r["title"] or r["filename"] or "")
+        if not norm:
+            continue
+        r["_norm"] = norm
+        buckets.setdefault(norm[:4], []).append(r)
+    for bucket in buckets.values():
+        for i, a in enumerate(bucket):
+            cluster = [a]
+            for b in bucket[i + 1:]:
+                if SequenceMatcher(None, a["_norm"], b["_norm"]).ratio() < 0.82:
+                    continue
+                da, dbb = a["duration"] or 0, b["duration"] or 0
+                if da and dbb and abs(da - dbb) > 3.0:
+                    continue
+                cluster.append(b)
+            if len(cluster) > 1:
+                emit(4, "Similar name and length", cluster, "possible")
+
+    groups.sort(key=lambda g: (g["tier"], -len(g["tracks"])))
+    return groups
+
+
+# --------------------------------------------------------------------------
+# versions — several takes of one song (demo, mixdown, final, instrumental…)
+# --------------------------------------------------------------------------
+
+# Words that mark a file as "a version of" something rather than part of the
+# title. Only trusted at the END of a name or inside brackets, so a title that
+# merely contains one ("Clean Slate") is left alone.
+_LT = (r"(?:v\d+(?:\.\d+)?|final(?:\s*final)*|finalfinal|master(?:ed)?|mixdown|"
+       r"mix(?:\s*\d+)?|remix|edit|demo|rough(?:\s+mix)?|draft|wip|bounce|export|"
+       r"take\s*\d+|instrumental|inst|a\s?cappella|acapella|acap|clean|dirty|"
+       r"explicit|radio\s+edit|extended|sped\s*up|slowed(?:\s*(?:\+|and|&)?\s*reverb)?|"
+       r"reverb|snippet|preview|alt(?:ernate)?(?:\s+(?:mix|version|take))?|acoustic|"
+       r"stems?|version\s*\d+|ver\s*\d+|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})")
+LABEL_ONLY = re.compile(r"%s(?:[\s,&+\-]+%s)*" % (_LT, _LT), re.I)
+LABEL_TRAIL = re.compile(r"[\s\-\u2013\u2014.]+(%s)\s*$" % _LT, re.I)
+BRACKET = re.compile(r"[\(\[\{]([^\)\]\}]*)[\)\]\}]")
+
+
+def _tidy_label(label):
+    label = re.sub(r"\s+", " ", label or "").strip()
+    if label and label == label.lower():
+        label = " ".join(w[:1].upper() + w[1:] for w in label.split())
+    return label
+
+
+def split_version(raw):
+    """'Redline v2 (Instrumental)' -> ('Redline', 'V2 Instrumental')."""
+    s_ = re.sub(r"\s+", " ", (raw or "").replace("_", " ")).strip()
+    labels = []
+
+    def take(m):
+        inner = m.group(1).strip()
+        if inner and LABEL_ONLY.fullmatch(inner):
+            labels.append(inner)
+            return " "
+        return m.group(0)
+
+    s_ = BRACKET.sub(take, s_)
+    while True:
+        s_ = s_.strip()
+        m = LABEL_TRAIL.search(s_)
+        if not m or not s_[:m.start()].strip(" -\u2013\u2014_."):
+            break
+        labels.insert(0, m.group(1).strip())
+        s_ = s_[:m.start()]
+    base = re.sub(r"\s+", " ", s_).strip(" -\u2013\u2014_.")
+    return base, _tidy_label(" ".join(labels))
+
+
+def song_key(name):
+    s_ = unicodedata.normalize("NFKD", name or "").lower()
+    return re.sub(r"[^a-z0-9]+", "", s_)
+
+
+def version_info(row):
+    """(song name, version label, grouping key) for one track. The title tag
+    wins for the song name; the label may come from either the tag or the
+    filename, so tracks that were all auto-filled to the same title still keep
+    the 'v2' / 'mixdown' hint that only their filename carries."""
+    title = (row.get("title") or "").strip()
+    fname = parse_filename(row.get("filename") or "")["title"]
+    tb, tl = split_version(title) if title else ("", "")
+    fb, fl = split_version(fname)
+    base = tb or fb or Path(row.get("filename") or "").stem
+    return base, (tl or fl), song_key(base)
+
+
+def grouped_map(conn=None):
+    own = conn is None
+    conn = conn or db()
+    m = {r["track_id"]: r["song"] for r in conn.execute(
+        "SELECT track_id, song FROM versions WHERE status='grouped'")}
+    if own:
+        conn.close()
+    return m
+
+
+def _mark_twins(tracks):
+    """Flag tracks inside one group that are byte- or audio-identical to
+    another member: those are copies, not versions."""
+    seen = {}
+    for t in tracks:
+        for k in ("file_hash", "audio_hash"):
+            if t.get(k):
+                seen.setdefault((k, t[k]), []).append(t["id"])
+    twins = {i for ids in seen.values() if len(ids) > 1 for i in ids}
+    for t in tracks:
+        t["twin"] = t["id"] in twins
+
+
+def _order(tracks):
+    tracks.sort(key=lambda t: (t.get("mtime") or 0, (t.get("filename") or "").lower()))
+    return tracks
+
+
+def build_versions():
+    conn = db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM tracks WHERE missing=0")]
+    vrows = {r["track_id"]: dict(r) for r in conn.execute("SELECT * FROM versions")}
+    conn.close()
+    by_id = {r["id"]: r for r in rows}
+
+    saved = {}
+    for tid, v in vrows.items():
+        if v["status"] != "grouped" or tid not in by_id:
+            continue
+        t = public(by_id[tid])
+        t["label"] = v["label"] or ""
+        saved.setdefault(v["song"].lower(), {"song": v["song"], "tracks": []})["tracks"].append(t)
+    saved_by_key = {song_key(g["song"]): g["song"] for g in saved.values()}
+
+    pending = {}
+    for r in rows:
+        if r["id"] in vrows:            # grouped already, or dismissed
+            continue
+        base, label, key = version_info(r)
+        if not key:
+            continue
+        t = public(r)
+        t["label"], t["base"] = label, base
+        pending.setdefault(key, []).append(t)
+
+    suggestions = []
+    for key, ts in pending.items():
+        if key in saved_by_key:
+            suggestions.append({"song": saved_by_key[key], "existing": True,
+                                "tracks": _order(ts)})
+        elif len({t.get("audio_hash") or t.get("file_hash") or t["id"] for t in ts}) >= 2:
+            # needs two genuinely different recordings: exact copies of one
+            # file are a job for the Duplicates tab, not versions
+            names = {}
+            for t in ts:
+                names[t["base"]] = names.get(t["base"], 0) + 1
+            song = sorted(names, key=lambda n: (-names[n], n))[0]
+            suggestions.append({"song": song, "existing": False, "tracks": _order(ts)})
+
+    groups = sorted(saved.values(), key=lambda g: g["song"].lower())
+    for g in groups:
+        _order(g["tracks"])
+    suggestions.sort(key=lambda g: g["song"].lower())
+    for g in groups + suggestions:
+        _mark_twins(g["tracks"])
+    return {"groups": groups, "suggestions": suggestions}
+
+
+def version_titles(song, tracks):
+    """Distinct, readable titles for one song's versions.
+    {track_id: 'Song (Label)'}. A single unlabelled take keeps the plain name;
+    several unlabelled takes become Version 1, Version 2… oldest first."""
+    unlabeled = [t for t in tracks if not (t.get("label") or "").strip()]
+    out, used, n_un = {}, {}, 0
+    for t in tracks:
+        label = (t.get("label") or "").strip()
+        if not label and len(unlabeled) > 1:
+            n_un += 1
+            label = "Version %d" % n_un
+        title = "%s (%s)" % (song, label) if label else song
+        k = title.lower()
+        if k in used:
+            used[k] += 1
+            title = "%s (%s %d)" % (song, label or "Version", used[k])
+        else:
+            used[k] = 1
+        out[t["id"]] = title
+    return out
+
+
+# --------------------------------------------------------------------------
+# lyrics
+# --------------------------------------------------------------------------
+
+LRC_TS = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
+LRC_META = re.compile(r"^\s*\[(ar|ti|al|au|by|length|re|ve|offset|#)\s*:[^\]]*\]\s*$", re.I)
+
+
+def parse_lrc(text):
+    """'[01:02.50]line' text -> [(62.5, 'line'), ...] sorted, or None if untimed."""
+    if not text or not LRC_TS.search(text):
+        return None
+    offset = 0.0
+    m = re.search(r"\[offset\s*:\s*([+-]?\d+)\s*\]", text, re.I)
+    if m:
+        offset = int(m.group(1)) / 1000.0
+    out = []
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        stamps = list(LRC_TS.finditer(raw))
+        if not stamps:
+            continue
+        line = LRC_TS.sub("", raw).strip()
+        for st in stamps:
+            mins = int(st.group(1))
+            secs = float(st.group(2).replace(":", "."))
+            out.append((max(0.0, round(mins * 60 + secs - offset, 3)), line))
+    out.sort(key=lambda x: x[0])
+    return out or None
+
+
+def to_lrc(lines):
+    rows = []
+    for t, line in lines:
+        t = max(0.0, float(t))
+        rows.append("[%02d:%05.2f]%s" % (int(t // 60), t - 60 * int(t // 60), line))
+    return "\n".join(rows)
+
+
+def plain_from_lrc(text):
+    keep = []
+    for raw in (text or "").replace("\r\n", "\n").split("\n"):
+        if LRC_META.match(raw):
+            continue
+        keep.append(LRC_TS.sub("", raw).rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(keep)).strip()
+
+
+def sidecar_lrc(path):
+    p = Path(path)
+    for cand in (p.with_suffix(".lrc"), p.with_suffix(".LRC")):
+        if cand.exists():
+            return cand
+    return None
+
+
+def _read_text_file(p):
+    raw = Path(p).read_bytes()
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def read_lyrics_full(path):
+    """{'plain': text, 'synced': [(seconds, line)] or None, 'source': where synced came from}."""
+    plain, synced, source = "", None, ""
+    try:
+        mf = MutagenFile(path)
+    except Exception:
+        mf = None
+    tags = getattr(mf, "tags", None) if mf is not None else None
+    if tags is not None:
+        if isinstance(tags, ID3):
+            sy = tags.getall("SYLT")
+            if sy:
+                fr = sy[0]
+                unit = 1000.0 if getattr(fr, "format", 2) == 2 else None
+                if unit and fr.text:
+                    synced = [(round(ts / unit, 3), str(txt).strip()) for txt, ts in fr.text]
+                    synced.sort(key=lambda x: x[0])
+                    source = "file"
+            us = tags.getall("USLT")
+            if us:
+                plain = str(us[0].text or "").strip()
+        else:
+            for key in ("\xa9lyr", "lyrics", "LYRICS", "unsyncedlyrics", "UNSYNCEDLYRICS",
+                        "syncedlyrics", "SYNCEDLYRICS"):
+                try:
+                    v = tags.get(key)
+                except Exception:
+                    v = None
+                if v:
+                    plain = (str(v[0]) if isinstance(v, list) else str(v)).strip()
+                    break
+    if plain and LRC_TS.search(plain):
+        timed = parse_lrc(plain)
+        if timed and not synced:
+            synced, source = timed, "file"
+        plain = plain_from_lrc(plain)
+    if not synced:
+        side = sidecar_lrc(path)
+        if side:
+            try:
+                txt = _read_text_file(side)
+                timed = parse_lrc(txt)
+                if timed:
+                    synced, source = timed, "lrc"
+                    if not plain:
+                        plain = plain_from_lrc(txt)
+            except OSError:
+                pass
+    if synced and not plain:
+        plain = "\n".join(line for _, line in synced)
+    return {"plain": plain, "synced": synced, "source": source}
+
+
+def read_lyrics(path):
+    return read_lyrics_full(path)["plain"]
+
+
+def write_lyrics(path, text, synced=None):
+    """Plain lyrics always; timed lines too when given. MP3 keeps both side by
+    side (USLT + SYLT); other formats store LRC text in their lyrics tag."""
+    text = (text or "").replace("\r\n", "\n").strip()
+    if synced and not text:
+        text = "\n".join(line for _, line in synced)
+    ext = Path(path).suffix.lower()
+    if ext == ".mp3":
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+        tags.delall("USLT")
+        tags.delall("SYLT")
+        if text:
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=text))
+        if synced:
+            tags.add(SYLT(encoding=3, lang="eng", format=2, type=1, desc="",
+                          text=[(line, int(round(t * 1000))) for t, line in synced]))
+        tags.save(path, v2_version=3)
+        return True
+    mf = MutagenFile(path)
+    if mf is None:
+        return False
+    if mf.tags is None:
+        try:
+            mf.add_tags()
+        except Exception:
+            return False
+    key = "\xa9lyr" if ext in (".m4a", ".mp4", ".aac") else "LYRICS"
+    value = to_lrc(synced) if synced else text
+    try:
+        if value:
+            mf.tags[key] = [value]
+        elif key in mf.tags:
+            del mf.tags[key]
+        mf.save()
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# online lyrics (LRCLIB — free, no account)
+# --------------------------------------------------------------------------
+
+LRCLIB_URL = "https://lrclib.net"
+HTTP_UA = "AURA music player (desktop)"
+
+
+def http_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def lrclib_lookup(title, artist, album="", duration=0):
+    """Best match from LRCLIB or None. Raises OSError when offline."""
+    q = {"track_name": title, "artist_name": artist}
+    if album:
+        q["album_name"] = album
+    if duration:
+        q["duration"] = int(round(duration))
+    try:
+        hit = http_json(LRCLIB_URL + "/api/get?" + urllib.parse.urlencode(q))
+        if hit and (hit.get("syncedLyrics") or hit.get("plainLyrics")):
+            return hit
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    res = http_json(LRCLIB_URL + "/api/search?" + urllib.parse.urlencode(
+        {"track_name": title, "artist_name": artist}))
+    res = [r for r in (res or []) if r.get("syncedLyrics") or r.get("plainLyrics")]
+    if not res:
+        return None
+    res.sort(key=lambda r: (not r.get("syncedLyrics"), abs((r.get("duration") or 0) - (duration or 0))))
+    best = res[0]
+    if duration and best.get("duration") and abs(best["duration"] - duration) > 12:
+        return None
+    return best
+
+
+# --------------------------------------------------------------------------
+# volume leveling — loudness of each song, measured in the background
+# --------------------------------------------------------------------------
+
+LEVEL_TARGET_DB = -14.0
+
+
+def measure_gain(path):
+    """dB to add so the song plays at about the same loudness as the rest."""
+    if np is None:
+        return 0.0
+    y = decode_mono(path, target_sr=11025, max_seconds=420)
+    if y is None or not len(y):
+        return 0.0
+    block = 4410
+    n = len(y) // block
+    if n < 1:
+        return 0.0
+    blocks = np.asarray(y[: n * block], dtype=np.float64).reshape(n, block)
+    power = (blocks ** 2).mean(axis=1)
+    gated = power[power > 1e-5]  # ignore near-silence (-50 dB)
+    if not len(gated):
+        return 0.0
+    loud = 10 * np.log10(gated.mean())
+    return float(max(-12.0, min(9.0, LEVEL_TARGET_DB - loud)))
+
+
+BG = {"busy": False, "levelled": 0}
+
+
+def background_worker(once=False):
+    """Fills in what scans leave for later: a one-time lyrics index for libraries
+    from before lyrics search existed, then volume levels for new or changed songs."""
+    while True:
+        try:
+            conn = db()
+            done = conn.execute("SELECT value FROM kv WHERE key='lyrics_indexed'").fetchone()
+            if not done:
+                rows = conn.execute("SELECT id, path FROM tracks WHERE missing=0").fetchall()
+                for r in rows:
+                    try:
+                        lf = read_lyrics_full(r["path"])
+                        conn.execute("UPDATE tracks SET lyrics=?, has_synced=? WHERE id=?",
+                                     (lf["plain"][:20000], 1 if lf["synced"] else 0, r["id"]))
+                    except Exception:
+                        pass
+                conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('lyrics_indexed', '1')")
+                conn.commit()
+            todo = conn.execute("SELECT id, path FROM tracks WHERE missing=0 AND gain_db IS NULL "
+                                "LIMIT 8").fetchall()
+            conn.close()
+            if todo and not SCAN_STATE["running"]:
+                BG["busy"] = True
+                for r in todo:
+                    try:
+                        g = measure_gain(r["path"]) if os.path.exists(r["path"]) else 0.0
+                    except Exception:
+                        g = 0.0
+                    c2 = db()
+                    c2.execute("UPDATE tracks SET gain_db=? WHERE id=?", (round(g, 2), r["id"]))
+                    c2.commit()
+                    c2.close()
+                    BG["levelled"] += 1
+                continue
+            BG["busy"] = False
+            if once:
+                return
+        except Exception:
+            BG["busy"] = False
+            if once:
+                return
+        time.sleep(4)
+
+
+# --------------------------------------------------------------------------
+# Discord "Listening to" status, over Discord's local IPC
+# --------------------------------------------------------------------------
+
+class DiscordRPC:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fp = None
+        self.sock = None
+        self.client_id = None
+        self.last = None
+        self.error = ""
+
+    def _paths(self):
+        if os.name == "nt":
+            return [r"\\?\pipe\discord-ipc-%d" % i for i in range(10)]
+        base = [os.environ.get(k) for k in ("XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP")] + ["/tmp"]
+        out = []
+        for b in [x for x in base if x]:
+            for sub in ("", "app/com.discordapp.Discord", "snap.discord"):
+                for i in range(10):
+                    out.append(os.path.join(b, sub, "discord-ipc-%d" % i))
+        return out
+
+    def _write(self, op, payload):
+        data = json.dumps(payload).encode("utf-8")
+        msg = struct.pack("<II", op, len(data)) + data
+        if self.sock is not None:
+            self.sock.sendall(msg)
+        else:
+            self.fp.write(msg)
+            self.fp.flush()
+
+    def _readn(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf)) if self.sock is not None else self.fp.read(n - len(buf))
+            if not chunk:
+                raise OSError("Discord closed the connection")
+            buf += chunk
+        return buf
+
+    def _read(self):
+        op, ln = struct.unpack("<II", self._readn(8))
+        return op, json.loads(self._readn(ln).decode("utf-8") or "{}")
+
+    @staticmethod
+    def _same(prev, act):
+        """Same song and about the same position: no need to resend."""
+        if prev is None:
+            return False
+        if act is None or prev == "cleared":
+            return act is None and prev == "cleared"
+        strip = lambda a: {k: v for k, v in a.items() if k != "timestamps"}
+        if strip(prev) != strip(act):
+            return False
+        ps, ns = prev.get("timestamps", {}).get("start", 0), act.get("timestamps", {}).get("start", 0)
+        return abs(ps - ns) < 2500
+
+    def close(self):
+        for h in (self.sock, self.fp):
+            try:
+                if h is not None:
+                    h.close()
+            except Exception:
+                pass
+        self.sock = self.fp = None
+        self.last = None
+
+    def _connect(self, client_id):
+        self.close()
+        for path in self._paths():
+            try:
+                if os.name == "nt":
+                    self.fp = open(path, "r+b", buffering=0)
+                else:
+                    if not os.path.exists(path):
+                        continue
+                    sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sk.settimeout(5)
+                    sk.connect(path)
+                    self.sock = sk
+            except OSError:
+                self.fp = self.sock = None
+                continue
+            try:
+                self._write(0, {"v": 1, "client_id": str(client_id)})
+                op, data = self._read()
+                if data.get("evt") == "READY":
+                    self.client_id = client_id
+                    return True
+                self.error = data.get("data", {}).get("message") or "Discord refused the connection"
+            except (OSError, ValueError, struct.error) as exc:
+                self.error = str(exc)
+            self.close()
+        if not self.error:
+            self.error = "Discord isn't running"
+        return False
+
+    def update(self, client_id, activity):
+        """activity None clears the status. Returns (ok, message)."""
+        with self.lock:
+            if not client_id:
+                self.close()
+                return False, "Add your Discord Application ID first"
+            if self.client_id == client_id and (self.fp or self.sock) and self._same(self.last, activity):
+                return True, "Connected"
+            for attempt in range(2):
+                if not (self.fp or self.sock) or self.client_id != client_id:
+                    self.error = ""
+                    if not self._connect(client_id):
+                        return False, self.error
+                try:
+                    self._write(1, {"cmd": "SET_ACTIVITY", "nonce": str(uuid.uuid4()),
+                                    "args": {"pid": os.getpid(), "activity": activity}})
+                    op, data = self._read()
+                    if data.get("evt") == "ERROR" and activity and "type" in activity:
+                        activity = {k: v for k, v in activity.items() if k != "type"}
+                        continue
+                    if data.get("evt") == "ERROR":
+                        return False, data.get("data", {}).get("message") or "Discord rejected the status"
+                    self.last = activity if activity is not None else "cleared"
+                    return True, "Connected"
+                except (OSError, ValueError, struct.error) as exc:
+                    self.error = str(exc)
+                    self.close()
+            return False, self.error or "Couldn't reach Discord"
+
+
+DISCORD = DiscordRPC()
+
+
+# --------------------------------------------------------------------------
+# version + updates (GitHub Releases)
+# --------------------------------------------------------------------------
+
+def app_version_info():
+    try:
+        v = json.loads((resource_dir() / "version.json").read_text(encoding="utf-8"))
+    except Exception:
+        v = {}
+    return {"version": str(v.get("version") or "0.0.0-dev"), "repo": str(v.get("repo") or "")}
+
+
+def version_tuple(v):
+    nums = re.findall(r"\d+", str(v).lstrip("vV").split("-")[0])
+    return tuple(int(n) for n in (nums + ["0", "0", "0"])[:3])
+
+
+GITHUB_API = "https://api.github.com"
+UPDATE = {"checked": 0, "result": None, "state": "idle", "done": 0, "total": 0, "error": ""}
+
+
+def check_update(force=False):
+    info = app_version_info()
+    if not info["repo"]:
+        return {"available": False, "reason": "This copy wasn't built by the release pipeline, so it can't update itself."}
+    if not force and UPDATE["result"] and time.time() - UPDATE["checked"] < 600:
+        return UPDATE["result"]
+    rel = http_json("%s/repos/%s/releases/latest" % (GITHUB_API, info["repo"]), timeout=10)
+    latest = str(rel.get("tag_name") or "").lstrip("vV")
+    asset = next((a for a in rel.get("assets", []) if str(a.get("name", "")).lower().endswith("setup.exe")), None)
+    out = {"available": bool(latest) and version_tuple(latest) > version_tuple(info["version"]) and asset is not None,
+           "current": info["version"], "latest": latest, "notes": (rel.get("body") or "")[:4000],
+           "page": rel.get("html_url") or "", "url": asset.get("browser_download_url") if asset else "",
+           "size": asset.get("size") if asset else 0}
+    UPDATE.update(checked=time.time(), result=out)
+    return out
+
+
+def _download_and_install(url, size):
+    try:
+        UPDATE.update(state="downloading", done=0, total=size or 0, error="")
+        dest = Path(tempfile.gettempdir()) / ("AURA-Setup-%d.exe" % int(time.time()))
+        req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as out:
+            UPDATE["total"] = int(r.headers.get("Content-Length") or size or 0)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                UPDATE["done"] += len(chunk)
+        if dest.stat().st_size < 100_000:
+            raise OSError("the download looks incomplete")
+        UPDATE["state"] = "installing"
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+                         close_fds=True, creationflags=flags)
+        threading.Timer(1.5, lambda: os._exit(0)).start()
+    except Exception as exc:
+        UPDATE.update(state="error", error=str(exc))
+
+
+# --------------------------------------------------------------------------
+# folder watcher — rescan when music is added, changed or removed
+# --------------------------------------------------------------------------
+
+def folder_signature(cfg):
+    """A cheap fingerprint of every audio file's name, size and date."""
+    h = hashlib.sha1()
+    n = 0
+    for path in iter_audio_files(cfg.get("folders", []), skip_dirs=[quarantine_dir(cfg)]):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        h.update(("%s|%d|%d\n" % (os.path.normcase(path), st.st_size, int(st.st_mtime))).encode("utf-8", "replace"))
+        n += 1
+    return "%d:%s" % (n, h.hexdigest())
+
+
+WATCH = {"sig": None}
+
+
+def folder_watcher(interval=20):
+    while True:
+        time.sleep(interval)
+        try:
+            cfg = load_config()
+            if not cfg.get("watch_folders", True) or not cfg.get("folders"):
+                WATCH["sig"] = None
+                continue
+            sig = folder_signature(cfg)
+            if WATCH["sig"] is None:
+                WATCH["sig"] = sig
+                continue
+            if sig != WATCH["sig"] and not SCAN_STATE["running"]:
+                if scan_library(deep=bool(cfg.get("fingerprint", True)), auto=True):
+                    WATCH["sig"] = folder_signature(cfg)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
+
+SEARCH_FIELDS = {
+    "title": "title", "artist": "artist", "album": "album",
+    "albumartist": "albumartist", "genre": "genre", "year": "year",
+    "key": "music_key", "producer": "producer", "prod": "producer",
+    "tag": "user_tags", "tags": "user_tags", "note": "notes",
+    "notes": "notes", "file": "filename", "folder": "folder",
+    "comment": "comment", "ext": "ext", "song": "song",
+}
+NUM_FIELDS = {"bpm": "bpm", "rating": "rating", "stars": "rating",
+              "bitrate": "bitrate", "year": "year"}
+CMP = re.compile(r"^(>=|<=|>|<|=)?\s*(\d+(?:\.\d+)?)$")
+
+
+def _tokenise(q):
+    return [t for t in re.findall(r'[^\s"]+|"[^"]*"', q) if t.strip()]
+
+
+def _num_ok(value, expr):
+    m = CMP.match(expr.strip())
+    if not m:
+        return None
+    op, num = m.group(1) or "=", float(m.group(2))
+    try:
+        v = float(re.sub(r"[^\d.]", "", str(value or "")) or 0)
+    except ValueError:
+        return False
+    return {"=": v == num, ">": v > num, "<": v < num,
+            ">=": v >= num, "<=": v <= num}[op]
+
+
+def match_query(row, q):
+    """Supports bare words, field:value, numeric comparisons and a few flags:
+    artist:juice  bpm:>140  rating:>=4  noart  untagged  "exact phrase" """
+    if not q:
+        return True
+    for raw in _tokenise(q):
+        neg = raw.startswith("-")
+        tok = raw[1:] if neg else raw
+        tok = tok.strip('"')
+        if not tok:
+            continue
+        ok = None
+        low = tok.lower()
+        if low in ("noart", "noartwork"):
+            ok = not row.get("has_art")
+        elif low in ("hasart", "art"):
+            ok = bool(row.get("has_art"))
+        elif low == "untagged":
+            ok = not (row.get("title") and row.get("artist"))
+        elif low == "unrated":
+            ok = not row.get("rating")
+        elif low == "versioned":
+            ok = bool(row.get("song"))
+        elif low == "unversioned":
+            ok = not row.get("song")
+        elif ":" in tok:
+            field, _, value = tok.partition(":")
+            field, value = field.lower(), value.strip('"')
+            if field in NUM_FIELDS:
+                r = _num_ok(row.get(NUM_FIELDS[field]), value)
+                ok = r if r is not None else (value.lower() in str(
+                    row.get(NUM_FIELDS[field]) or "").lower())
+            elif field in SEARCH_FIELDS:
+                ok = value.lower() in str(row.get(SEARCH_FIELDS[field]) or "").lower()
+        if ok is None:
+            hay = " ".join(str(row.get(k) or "") for k in
+                           ("filename", "title", "artist", "album", "albumartist",
+                            "notes", "user_tags", "genre", "producer", "folder")).lower()
+            ok = low in hay
+        if ok == neg:
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# api
+# --------------------------------------------------------------------------
+
+def public(row):
+    r = dict(row)
+    r.pop("fingerprint", None)
+    r.pop("_norm", None)
+    return r
+
+
+@app.route("/")
+def index():
+    html = (resource_dir() / "templates" / "index.html").read_text(encoding="utf-8")
+    return Response(html.replace("__TOKEN__", TOKEN), mimetype="text/html")
+
+
+@app.get("/api/config")
+def api_get_config():
+    cfg = load_config()
+    cfg["fingerprinting"] = CAN_FINGERPRINT
+    cfg["decoder"] = "libsndfile" if _sf is not None else ("ffmpeg" if FFMPEG else "none")
+    cfg["data_dir"] = str(DATA_DIR)
+    cfg["quarantine_effective"] = str(quarantine_dir(cfg) or "")
+    cfg["configured"] = bool(cfg.get("folders"))
+    return jsonify(cfg)
+
+
+@app.post("/api/config")
+def api_set_config():
+    cfg = load_config()
+    body = request.get_json(force=True)
+    for key in ("folders", "quarantine", "rename_pattern",
+                "write_tags_to_file", "fingerprint", "watch_folders",
+                "discord", "discord_client_id"):
+        if key in body:
+            cfg[key] = body[key]
+    if isinstance(body.get("defaults"), dict):
+        cfg["defaults"].update({k: str(v) for k, v in body["defaults"].items()
+                                if k in cfg["defaults"]})
+    save_config(cfg)
+    cfg["quarantine_effective"] = str(quarantine_dir(cfg) or "")
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.post("/api/browse")
+def api_browse():
+    body = request.get_json(force=True) or {}
+    target = body.get("path") or ""
+    if not target:
+        if os.name == "nt":
+            home = str(Path.home())
+            shortcuts = [("Music", Path(home) / "Music"),
+                         ("Downloads", Path(home) / "Downloads"),
+                         ("Desktop", Path(home) / "Desktop"),
+                         ("Documents", Path(home) / "Documents")]
+            dirs = [{"name": n, "path": str(p)} for n, p in shortcuts if p.is_dir()]
+            dirs += [{"name": "%s:\\" % d, "path": "%s:\\" % d}
+                     for d in "CDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists("%s:\\" % d)]
+            return jsonify({"path": "", "parent": None, "dirs": dirs})
+        target = str(Path.home())
+    p = Path(target)
+    if not p.is_dir():
+        return jsonify({"error": "Not a folder"}), 400
+    dirs = []
+    try:
+        for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if entry.is_dir() and not entry.name.startswith("."):
+                    dirs.append({"name": entry.name, "path": str(entry)})
+            except OSError:
+                continue
+    except PermissionError:
+        return jsonify({"error": "No permission to read that folder"}), 403
+    return jsonify({"path": str(p),
+                    "parent": str(p.parent) if p.parent != p else None, "dirs": dirs})
+
+
+@app.post("/api/scan")
+def api_scan():
+    if SCAN_STATE["running"]:
+        return jsonify({"ok": False, "message": "Already scanning"}), 409
+    deep = bool((request.get_json(silent=True) or {}).get("deep", True))
+    threading.Thread(target=scan_library, args=(deep,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/scan/status")
+def api_scan_status():
+    return jsonify(SCAN_STATE)
+
+
+@app.get("/api/tracks")
+def api_tracks():
+    q = (request.args.get("q") or "").strip()
+    sort = request.args.get("sort") or "filename"
+    folder = request.args.get("folder") or ""
+
+    conn = db()
+    sql, args = (
+        "SELECT t.*, v.song AS song, v.label AS version_label FROM tracks t "
+        "LEFT JOIN versions v ON v.track_id=t.id AND v.status='grouped' "
+        "WHERE t.missing=0"), []
+    if folder:
+        sql += " AND t.folder LIKE ?"
+        args.append(folder + "%")
+    rows = [public(r) for r in conn.execute(sql, args)]
+    stats = conn.execute(
+        "SELECT COUNT(*) total, "
+        "SUM(CASE WHEN rating>0 THEN 1 ELSE 0 END) rated, "
+        "SUM(CASE WHEN has_art=0 THEN 1 ELSE 0 END) noart, "
+        "SUM(CASE WHEN title='' OR title IS NULL OR artist='' OR artist IS NULL "
+        "         THEN 1 ELSE 0 END) untagged "
+        "FROM tracks WHERE missing=0").fetchone()
+    missing = conn.execute("SELECT COUNT(*) c FROM tracks WHERE missing=1").fetchone()["c"]
+    versioned = conn.execute(
+        "SELECT COUNT(*) c FROM versions v JOIN tracks t ON t.id=v.track_id "
+        "WHERE v.status='grouped' AND t.missing=0").fetchone()["c"]
+    conn.close()
+
+    if q:
+        rows = [r for r in rows if match_query(r, q)]
+
+    keyfns = {
+        "filename": lambda r: (r.get("filename") or "").lower(),
+        "title": lambda r: (r.get("title") or r.get("filename") or "").lower(),
+        "artist": lambda r: (r.get("artist") or "").lower(),
+        "duration": lambda r: -(r.get("duration") or 0),
+        "newest": lambda r: -(r.get("mtime") or 0),
+        "oldest": lambda r: (r.get("mtime") or 0),
+        "rating": lambda r: (-(r.get("rating") or 0), (r.get("filename") or "").lower()),
+        "size": lambda r: -(r.get("size") or 0),
+    }
+    rows.sort(key=keyfns.get(sort, keyfns["filename"]))
+    return jsonify({
+        "tracks": rows, "showing": len(rows),
+        "stats": {"total": stats["total"] or 0, "rated": stats["rated"] or 0,
+                  "noart": stats["noart"] or 0, "untagged": stats["untagged"] or 0,
+                  "missing": missing, "versioned": versioned},
+    })
+
+
+@app.get("/api/track/<int:tid>")
+def api_track(tid):
+    conn = db()
+    row = conn.execute(
+        "SELECT t.*, v.song AS song, v.label AS version_label FROM tracks t "
+        "LEFT JOIN versions v ON v.track_id=t.id AND v.status='grouped' "
+        "WHERE t.id=?", (tid,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(public(row))
+
+
+@app.post("/api/track/<int:tid>")
+def api_save_track(tid):
+    body = request.get_json(force=True)
+    cfg = load_config()
+    conn = db()
+    row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    data = {f: (body.get(f) if body.get(f) is not None else row[f]) or "" for f in TAG_FIELDS}
+    data["rating"] = int(body.get("rating", row["rating"] or 0) or 0)
+
+    old = {f: row[f] for f in TAG_FIELDS if str(row[f] or "") != str(data[f] or "")}
+    if (row["rating"] or 0) != data["rating"]:
+        old["rating"] = row["rating"] or 0
+    if old:
+        record_undo(conn, "Edited %s" % (row["title"] or row["filename"]), {tid: old})
+
+    warning = ""
+    try:
+        write_tags(row["path"], data, cfg.get("write_tags_to_file", True))
+    except Exception as exc:
+        warning = "Saved to the library, but writing tags into the file failed: %s" % exc
+
+    conn.execute("UPDATE tracks SET %s WHERE id=?" % ", ".join("%s=?" % k for k in data),
+                 (*data.values(), tid))
+    try:
+        st = os.stat(row["path"])
+        conn.execute("UPDATE tracks SET mtime=?, size=?, file_hash=? WHERE id=?",
+                     (st.st_mtime, st.st_size, file_sha256(row["path"]), tid))
+    except OSError:
+        pass
+    conn.commit()
+    out = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    return jsonify({"ok": True, "warning": warning, "track": public(out)})
+
+
+def apply_changes(conn, cfg, per_track, label):
+    """per_track: {track_id: {field: new_value}}. Writes tags, updates the
+    database and records one undo batch covering the lot."""
+    undo, applied, failed = {}, 0, 0
+    for tid, fields in per_track.items():
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            continue
+        changed = {f: v for f, v in fields.items() if str(row[f] or "") != str(v or "")}
+        if not changed:
+            continue
+        undo[tid] = {f: row[f] for f in changed}
+        merged = {k: row[k] for k in row.keys()}
+        merged.update(changed)
+        try:
+            write_tags(row["path"], merged, cfg.get("write_tags_to_file", True))
+        except Exception:
+            failed += 1
+        conn.execute("UPDATE tracks SET %s WHERE id=?" % ", ".join("%s=?" % f for f in changed),
+                     (*changed.values(), tid))
+        applied += 1
+    batch = record_undo(conn, label, undo)
+    conn.commit()
+    return applied, failed, batch
+
+
+@app.post("/api/bulk")
+def api_bulk():
+    body = request.get_json(force=True)
+    ids = [int(i) for i in body.get("ids", [])]
+    if not ids:
+        return jsonify({"ok": False, "message": "No tracks selected"}), 400
+    updates = {}
+    if body.get("rating") is not None:
+        updates["rating"] = int(body["rating"])
+    for f in ("artist", "albumartist", "album", "genre", "year", "user_tags",
+              "producer", "comment"):
+        if body.get(f) is not None:
+            updates[f] = body[f]
+    if not updates:
+        return jsonify({"ok": False, "message": "Nothing to change"}), 400
+    cfg = load_config()
+    conn = db()
+    applied, failed, batch = apply_changes(
+        conn, cfg, {i: dict(updates) for i in ids},
+        "Bulk edit of %d tracks" % len(ids))
+    conn.close()
+    return jsonify({"ok": True, "changed": applied, "failed": failed, "batch": batch})
+
+
+@app.post("/api/autofill")
+def api_autofill():
+    """Two tools in one: stamp the library defaults onto every track, and lift a
+    clean title (plus producer) out of each filename. Always previewed first."""
+    body = request.get_json(silent=True) or {}
+    use_defaults = body.get("defaults", True)
+    use_filename = body.get("filenames", True)
+    overwrite = body.get("overwrite", False)
+    cfg = load_config()
+    defaults = {k: v for k, v in (cfg.get("defaults") or {}).items() if str(v).strip()}
+
+    conn = db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM tracks WHERE missing=0")]
+
+    proposals = []
+    for t in rows:
+        changes = {}
+        if use_defaults:
+            for f, v in defaults.items():
+                if overwrite or not str(t.get(f) or "").strip():
+                    if str(t.get(f) or "") != str(v):
+                        changes[f] = v
+        if use_filename:
+            parsed = parse_filename(t["filename"], defaults.get("artist", ""))
+            if parsed["title"] and (overwrite or not str(t.get("title") or "").strip()):
+                if parsed["title"] != (t.get("title") or ""):
+                    changes["title"] = parsed["title"]
+            if parsed["producer"] and (overwrite or not str(t.get("producer") or "").strip()):
+                if parsed["producer"] != (t.get("producer") or ""):
+                    changes["producer"] = parsed["producer"]
+        if changes:
+            proposals.append({"id": t["id"], "filename": t["filename"],
+                              "current_title": t.get("title") or "",
+                              "changes": changes})
+
+    if not body.get("apply"):
+        conn.close()
+        return jsonify({"proposals": proposals, "applied": False,
+                        "defaults": defaults})
+
+    keep = set(body.get("ids") or [p["id"] for p in proposals])
+    per_track = {p["id"]: p["changes"] for p in proposals if p["id"] in keep}
+    applied, failed, batch = apply_changes(
+        conn, cfg, per_track, "Auto-filled %d tracks" % len(per_track))
+    conn.close()
+    return jsonify({"applied": True, "changed": applied, "failed": failed,
+                    "batch": batch})
+
+
+@app.get("/api/undo")
+def api_undo_list():
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM undo_batches ORDER BY id DESC LIMIT 20")]
+    conn.close()
+    return jsonify({"batches": rows})
+
+
+@app.post("/api/undo")
+def api_undo_apply():
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    if body.get("batch"):
+        batch = int(body["batch"])
+    else:
+        last = conn.execute("SELECT id FROM undo_batches ORDER BY id DESC LIMIT 1").fetchone()
+        if not last:
+            conn.close()
+            return jsonify({"ok": False, "message": "Nothing to undo"}), 400
+        batch = last["id"]
+
+    items = [dict(r) for r in conn.execute(
+        "SELECT * FROM undo_items WHERE batch_id=?", (batch,))]
+    meta = conn.execute("SELECT * FROM undo_batches WHERE id=?", (batch,)).fetchone()
+    if not items or not meta:
+        conn.close()
+        return jsonify({"ok": False, "message": "That change is no longer available"}), 400
+
+    cfg = load_config()
+    per_track = {}
+    for it in items:
+        per_track.setdefault(it["track_id"], {})[it["field"]] = it["old_value"]
+    for tid, fields in per_track.items():
+        if "rating" in fields:
+            try:
+                fields["rating"] = int(fields["rating"] or 0)
+            except ValueError:
+                fields["rating"] = 0
+
+    label = meta["label"]
+    restored, failed, _ = apply_changes(conn, cfg, per_track, "Undid: %s" % label)
+    conn.execute("DELETE FROM undo_items WHERE batch_id=?", (batch,))
+    conn.execute("DELETE FROM undo_batches WHERE id=?", (batch,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "restored": restored, "failed": failed, "label": label})
+
+
+@app.get("/api/audio/<int:tid>")
+def api_audio(tid):
+    conn = db()
+    row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    if not row or not os.path.exists(row["path"]):
+        return jsonify({"error": "missing"}), 404
+    return send_file(row["path"], conditional=True)
+
+
+@app.get("/api/art/<int:tid>")
+def api_art(tid):
+    conn = db()
+    row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    if not row:
+        return "", 404
+    data, mime = get_artwork(row["path"])
+    if not data:
+        return "", 404
+    return Response(data, mimetype=mime, headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/art/<int:tid>")
+def api_set_art(tid):
+    conn = db()
+    row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    f = request.files.get("image")
+    try:
+        if f:
+            set_artwork(row["path"], f.read(), f.mimetype)
+            conn.execute("UPDATE tracks SET has_art=1 WHERE id=?", (tid,))
+        else:
+            set_artwork(row["path"], None, None)
+            conn.execute("UPDATE tracks SET has_art=0 WHERE id=?", (tid,))
+        conn.commit()
+    except Exception as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 500
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/art/bulk")
+def api_art_bulk():
+    """Apply one cover image to many tracks at once."""
+    ids = [int(i) for i in json.loads(request.form.get("ids", "[]"))]
+    f = request.files.get("image")
+    if not f or not ids:
+        return jsonify({"error": "Need an image and at least one track"}), 400
+    blob, mime = f.read(), f.mimetype
+    conn = db()
+    done = failed = 0
+    for tid in ids:
+        row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            continue
+        try:
+            set_artwork(row["path"], blob, mime)
+            conn.execute("UPDATE tracks SET has_art=1 WHERE id=?", (tid,))
+            done += 1
+        except Exception:
+            failed += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "changed": done, "failed": failed})
+
+
+def safe_name(s):
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", s or "")
+    return re.sub(r"\s+", " ", s).strip(" .")[:150] or "untitled"
+
+
+@app.post("/api/rename")
+def api_rename():
+    """Rename one track or many, from the pattern in Settings."""
+    body = request.get_json(force=True) or {}
+    cfg = load_config()
+    pattern = body.get("pattern") or cfg.get("rename_pattern", "{title}")
+    ids = [int(i) for i in body.get("ids", [])]
+    conn = db()
+    renamed, errors, unchanged = [], [], 0
+    for tid in ids:
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            continue
+        fields = {k: (row[k] or "") for k in
+                  ("title", "artist", "albumartist", "album", "year", "genre",
+                   "track_no", "producer")}
+        if not fields["title"]:
+            fields["title"] = Path(row["filename"]).stem
+        try:
+            base = safe_name(pattern.format(**fields))
+        except KeyError as exc:
+            conn.close()
+            return jsonify({"error": "Unknown field in pattern: %s" % exc}), 400
+        base = re.sub(r"^[\s\-]+|[\s\-]+$", "", base) or Path(row["filename"]).stem
+        suffix = Path(row["path"]).suffix.lower()
+        dest = Path(row["folder"]) / (base + suffix)
+        if os.path.normcase(str(dest)) == os.path.normcase(row["path"]):
+            unchanged += 1
+            continue
+        n = 2
+        while dest.exists():
+            dest = Path(row["folder"]) / ("%s (%d)%s" % (base, n, suffix))
+            n += 1
+        try:
+            os.rename(row["path"], dest)
+            conn.execute("UPDATE tracks SET path=?, filename=? WHERE id=?",
+                         (str(dest), dest.name, tid))
+            renamed.append(dest.name)
+        except OSError as exc:
+            errors.append("%s: %s" % (row["filename"], exc))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "renamed": renamed, "unchanged": unchanged,
+                    "errors": errors})
+
+
+@app.get("/api/duplicates")
+def api_duplicates():
+    thr = float(request.args.get("threshold", 0.78))
+    return jsonify({"groups": find_duplicates(thr), "fingerprinting": CAN_FINGERPRINT})
+
+
+@app.post("/api/duplicates/quarantine")
+def api_quarantine():
+    """Move the losers of a duplicate group into a holding folder. Nothing is
+    ever deleted. `protect` lists every track chosen as a keeper anywhere — a
+    file can be the keeper of one group and a loser in another, and without this
+    guard a bulk resolve could move every copy of a song."""
+    body = request.get_json(force=True)
+    protect = {int(i) for i in body.get("protect", [])}
+    requested = [int(i) for i in body.get("ids", [])]
+    ids = [i for i in requested if i not in protect]
+    cfg = load_config()
+    qdir = quarantine_dir(cfg)
+    if qdir is None:
+        return jsonify({"error": "Add a music folder first"}), 400
+    try:
+        qdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return jsonify({"error": "Cannot create %s: %s" % (qdir, exc)}), 500
+
+    conn = db()
+    moved, errors, skipped = [], [], []
+    for tid in ids:
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            continue
+        if not os.path.exists(row["path"]):
+            conn.execute("UPDATE tracks SET missing=1 WHERE id=?", (tid,))
+            skipped.append(row["filename"])
+            continue
+        dest = qdir / row["filename"]
+        n = 2
+        while dest.exists():
+            stem, suf = Path(row["filename"]).stem, Path(row["filename"]).suffix
+            dest = qdir / ("%s (%d)%s" % (stem, n, suf))
+            n += 1
+        try:
+            shutil.move(row["path"], str(dest))
+            conn.execute("UPDATE tracks SET missing=1 WHERE id=?", (tid,))
+            moved.append(str(dest))
+        except Exception as exc:
+            errors.append("%s: %s" % (row["filename"], exc))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "moved": moved, "errors": errors,
+                    "skipped": skipped, "folder": str(qdir),
+                    "protected": len(protect & set(requested))})
+
+
+# ---- versions api ----
+
+def _canon_song(conn, name, exclude=""):
+    """Reuse the existing spelling of a song so 'redline' joins 'Redline'.
+    `exclude` is the group being renamed, so it can change its own casing."""
+    row = conn.execute(
+        "SELECT song FROM versions WHERE status='grouped' AND song=? COLLATE NOCASE "
+        "AND song<>? COLLATE NOCASE LIMIT 1", (name, exclude or "\x00")).fetchone()
+    return row["song"] if row else name
+
+
+@app.get("/api/versions")
+def api_versions():
+    return jsonify(build_versions())
+
+
+@app.post("/api/versions/guess")
+def api_versions_guess():
+    """A sensible song name for a hand-picked set of tracks."""
+    ids = [int(i) for i in (request.get_json(force=True) or {}).get("ids", [])]
+    conn = db()
+    names = {}
+    for tid in ids:
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+        if row:
+            base = version_info(dict(row))[0]
+            names[base] = names.get(base, 0) + 1
+    conn.close()
+    song = sorted(names, key=lambda n: (-names[n], len(n), n))[0] if names else ""
+    return jsonify({"song": song})
+
+
+@app.post("/api/versions/save")
+def api_versions_save():
+    """Group tracks as versions of one song. items: [{id, label?}] — a missing
+    label is worked out from the title/filename."""
+    body = request.get_json(force=True) or {}
+    song = (body.get("song") or "").strip()
+    items = body.get("items") or []
+    if not song:
+        return jsonify({"error": "Give the song a name"}), 400
+    if not items:
+        return jsonify({"error": "No tracks to group"}), 400
+    conn = db()
+    song = _canon_song(conn, song)
+    n = 0
+    for it in items:
+        row = conn.execute("SELECT * FROM tracks WHERE id=?", (int(it["id"]),)).fetchone()
+        if not row:
+            continue
+        label = it.get("label")
+        if label is None:
+            label = version_info(dict(row))[1]
+        conn.execute(
+            "INSERT INTO versions (track_id, song, label, status) VALUES (?,?,?,'grouped') "
+            "ON CONFLICT(track_id) DO UPDATE SET song=excluded.song, "
+            "label=excluded.label, status='grouped'",
+            (row["id"], song, (label or "").strip()))
+        n += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "grouped": n, "song": song})
+
+
+@app.post("/api/versions/rename")
+def api_versions_rename():
+    body = request.get_json(force=True) or {}
+    old, new = (body.get("song") or "").strip(), (body.get("name") or "").strip()
+    if not old or not new:
+        return jsonify({"error": "Give the song a name"}), 400
+    conn = db()
+    new = _canon_song(conn, new, exclude=old)
+    conn.execute("UPDATE versions SET song=? WHERE status='grouped' AND song=? COLLATE NOCASE",
+                 (new, old))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "song": new})
+
+
+@app.post("/api/versions/label")
+def api_versions_label():
+    body = request.get_json(force=True) or {}
+    conn = db()
+    conn.execute("UPDATE versions SET label=? WHERE track_id=? AND status='grouped'",
+                 ((body.get("label") or "").strip(), int(body["id"])))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/versions/dismiss")
+def api_versions_dismiss():
+    """Take tracks out of their group, or reject a suggestion. Either way they
+    are remembered as 'not a version' so they are not suggested again."""
+    ids = [int(i) for i in (request.get_json(force=True) or {}).get("ids", [])]
+    conn = db()
+    for tid in ids:
+        conn.execute(
+            "INSERT INTO versions (track_id, song, label, status) VALUES (?,'','','ignored') "
+            "ON CONFLICT(track_id) DO UPDATE SET song='', label='', status='ignored'", (tid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "n": len(ids)})
+
+
+@app.post("/api/versions/dissolve")
+def api_versions_dissolve():
+    song = ((request.get_json(force=True) or {}).get("song") or "").strip()
+    conn = db()
+    conn.execute("UPDATE versions SET song='', label='', status='ignored' "
+                 "WHERE status='grouped' AND song=? COLLATE NOCASE", (song,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/versions/titles")
+def api_versions_titles():
+    """Write 'Song (Label)' into each version's title so they are tellable
+    apart in any player. Previewed first; one undo batch when applied."""
+    body = request.get_json(force=True) or {}
+    wanted = {s_.lower() for s_ in (body.get("songs") or [])}
+    set_album = bool(body.get("album"))
+    cfg = load_config()
+    data = build_versions()
+    per_track, preview = {}, []
+    for g in data["groups"]:
+        if wanted and g["song"].lower() not in wanted:
+            continue
+        titles = version_titles(g["song"], g["tracks"])
+        for t in g["tracks"]:
+            changes = {}
+            if (t.get("title") or "") != titles[t["id"]]:
+                changes["title"] = titles[t["id"]]
+            if set_album and (t.get("album") or "") != g["song"]:
+                changes["album"] = g["song"]
+            if changes:
+                per_track[t["id"]] = changes
+                preview.append({"id": t["id"], "filename": t["filename"],
+                                "from": t.get("title") or "", "to": titles[t["id"]],
+                                "album": changes.get("album", "")})
+    if not body.get("apply"):
+        return jsonify({"preview": preview})
+    conn = db()
+    applied, failed, batch = apply_changes(
+        conn, cfg, per_track, "Version titles on %d tracks" % len(per_track))
+    conn.close()
+    return jsonify({"ok": True, "changed": applied, "failed": failed, "batch": batch})
+
+
+# --------------------------------------------------------------------------
+# player — favorites and playlists
+# --------------------------------------------------------------------------
+
+PLAYER_FIELDS = ("id", "title", "artist", "album", "filename", "folder", "duration",
+                 "has_art", "first_seen", "mtime", "rating", "year", "genre")
+
+
+@app.get("/api/player/library")
+def api_player_library():
+    """Every playable track with just what the player needs, plus favorites."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT t.id, t.title, t.artist, t.album, t.filename, t.folder, t.duration, "
+        "t.has_art, t.first_seen, t.mtime, t.rating, t.year, t.genre, t.track_no, t.albumartist, "
+        "t.gain_db, t.has_synced, (COALESCE(t.lyrics,'')<>'') AS has_lyrics, "
+        "f.track_id IS NOT NULL AS favorite, f.added AS fav_added, "
+        "v.song AS song, v.label AS version_label, "
+        "COALESCE(pc.count, 0) AS plays, pc.last_played AS last_played "
+        "FROM tracks t LEFT JOIN favorites f ON f.track_id=t.id "
+        "LEFT JOIN plays pc ON pc.track_id=t.id "
+        "LEFT JOIN versions v ON v.track_id=t.id AND v.status='grouped' "
+        "WHERE t.missing=0").fetchall()
+    conn.close()
+    return jsonify({"tracks": [dict(r) for r in rows]})
+
+
+@app.get("/api/player/state")
+def api_player_state_get():
+    conn = db()
+    row = conn.execute("SELECT value FROM kv WHERE key='player_state'").fetchone()
+    conn.close()
+    try:
+        state = json.loads(row["value"]) if row else {}
+    except ValueError:
+        state = {}
+    return jsonify({"state": state})
+
+
+@app.post("/api/player/state")
+def api_player_state_set():
+    raw = request.get_data(as_text=True) or "{}"
+    if len(raw) > 4_000_000:
+        return jsonify({"error": "state too large"}), 413
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        return jsonify({"error": "bad json"}), 400
+    if not isinstance(state, dict):
+        return jsonify({"error": "bad state"}), 400
+    conn = db()
+    conn.execute("INSERT INTO kv (key, value) VALUES ('player_state', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(state),))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/player/played/<int:tid>")
+def api_player_played(tid):
+    now = time.time()
+    conn = db()
+    if not conn.execute("SELECT 1 FROM tracks WHERE id=?", (tid,)).fetchone():
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("INSERT INTO plays (track_id, count, last_played) VALUES (?, 1, ?) "
+                 "ON CONFLICT(track_id) DO UPDATE SET count=count+1, last_played=excluded.last_played",
+                 (tid, now))
+    row = conn.execute("SELECT count FROM plays WHERE track_id=?", (tid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "plays": row["count"], "last_played": now})
+
+
+def _track_row(tid):
+    conn = db()
+    row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    return row
+
+
+@app.get("/api/lyrics/<int:tid>")
+def api_lyrics_get(tid):
+    row = _track_row(tid)
+    if not row or not os.path.exists(row["path"]):
+        return jsonify({"error": "missing"}), 404
+    lf = read_lyrics_full(row["path"])
+    return jsonify({"lyrics": lf["plain"],
+                    "synced": [{"t": t, "text": line} for t, line in lf["synced"]] if lf["synced"] else None,
+                    "source": lf["source"],
+                    "editable": (row["ext"] or "").lower() in ("mp3", "m4a", "mp4", "aac", "flac", "ogg", "opus")})
+
+
+@app.post("/api/lyrics/<int:tid>")
+def api_lyrics_set(tid):
+    body = request.get_json(force=True) or {}
+    text = body.get("lyrics") or ""
+    synced = body.get("synced")
+    if len(text) > 200_000:
+        return jsonify({"error": "Lyrics are too long"}), 400
+    lines = None
+    if synced:
+        try:
+            lines = sorted(((max(0.0, float(x["t"])), str(x.get("text", ""))[:500]) for x in synced),
+                           key=lambda x: x[0])
+        except (TypeError, ValueError, KeyError):
+            return jsonify({"error": "Bad timed lyrics"}), 400
+        if len(lines) > 2000:
+            return jsonify({"error": "Too many lines"}), 400
+    row = _track_row(tid)
+    if not row or not os.path.exists(row["path"]):
+        return jsonify({"error": "That file is missing"}), 404
+    try:
+        ok = write_lyrics(row["path"], text, lines)
+    except Exception as exc:
+        return jsonify({"error": "Couldn't save lyrics: %s" % exc}), 500
+    if not ok:
+        return jsonify({"error": "This file type can't hold lyrics"}), 400
+    lf = read_lyrics_full(row["path"])
+    conn = db()
+    st = os.stat(row["path"])
+    conn.execute("UPDATE tracks SET lyrics=?, has_synced=?, size=?, mtime=? WHERE id=?",
+                 (lf["plain"][:20000], 1 if lf["synced"] else 0, st.st_size, st.st_mtime, tid))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "synced": bool(lf["synced"])})
+
+
+@app.get("/api/lyrics/<int:tid>/lookup")
+def api_lyrics_lookup(tid):
+    row = _track_row(tid)
+    if not row:
+        return jsonify({"error": "missing"}), 404
+    title = split_version(row["title"] or Path(row["filename"]).stem)[0] or row["title"] or ""
+    artist = (row["artist"] or "").split(",")[0].split(" feat")[0].split(" ft.")[0].strip()
+    if not title or not artist:
+        return jsonify({"found": False, "reason": "This song needs a title and artist tag to look it up."})
+    try:
+        hit = lrclib_lookup(title, artist, row["album"] or "", row["duration"] or 0)
+    except Exception:
+        return jsonify({"error": "Couldn't reach the lyrics service — check your internet connection."}), 502
+    if not hit:
+        return jsonify({"found": False, "reason": "No lyrics found online for %s by %s." % (title, artist)})
+    timed = parse_lrc(hit.get("syncedLyrics") or "")
+    return jsonify({"found": True, "title": hit.get("trackName") or title, "artist": hit.get("artistName") or artist,
+                    "lyrics": (hit.get("plainLyrics") or plain_from_lrc(hit.get("syncedLyrics") or "")).strip(),
+                    "synced": [{"t": t, "text": line} for t, line in timed] if timed else None})
+
+
+@app.get("/api/lyrics/search")
+def api_lyrics_search():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 3:
+        return jsonify({"hits": []})
+    conn = db()
+    rows = conn.execute("SELECT id, lyrics FROM tracks WHERE missing=0 AND lyrics LIKE ? LIMIT 300",
+                        ("%" + q.replace("%", "").replace("_", "") + "%",)).fetchall()
+    conn.close()
+    ql = q.lower()
+    hits = []
+    for r in rows:
+        line = next((ln.strip() for ln in (r["lyrics"] or "").split("\n") if ql in ln.lower()), "")
+        hits.append({"id": r["id"], "line": line[:140]})
+    return jsonify({"hits": hits})
+
+
+# ---- stats ----
+
+@app.post("/api/player/listened")
+def api_player_listened():
+    body = request.get_json(force=True) or {}
+    try:
+        tid, secs = int(body.get("id")), float(body.get("seconds") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad request"}), 400
+    row = _track_row(tid)
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    secs = min(secs, (row["duration"] or secs) + 5)
+    if secs >= 5:
+        conn = db()
+        conn.execute("INSERT INTO history (track_id, ts, seconds) VALUES (?,?,?)", (tid, time.time(), secs))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/stats")
+def api_stats():
+    now = time.time()
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    conn = db()
+    q = lambda sql, *a: conn.execute(sql, a).fetchone()[0] or 0
+    out = {
+        "all_seconds": q("SELECT SUM(seconds) FROM history"),
+        "week_seconds": q("SELECT SUM(seconds) FROM history WHERE ts>=?", midnight - 6 * 86400),
+        "month_seconds": q("SELECT SUM(seconds) FROM history WHERE ts>=?", midnight - 29 * 86400),
+        "today_seconds": q("SELECT SUM(seconds) FROM history WHERE ts>=?", midnight),
+        "tracks": q("SELECT COUNT(*) FROM tracks WHERE missing=0"),
+        "never_played": q("SELECT COUNT(*) FROM tracks t LEFT JOIN plays p ON p.track_id=t.id "
+                          "WHERE t.missing=0 AND COALESCE(p.count,0)=0"),
+        "favorites": q("SELECT COUNT(*) FROM favorites f JOIN tracks t ON t.id=f.track_id WHERE t.missing=0"),
+    }
+    days = []
+    for k in range(29, -1, -1):
+        a = midnight - k * 86400
+        d = time.localtime(a)
+        days.append({"day": "%04d-%02d-%02d" % (d.tm_year, d.tm_mon, d.tm_mday),
+                     "seconds": q("SELECT SUM(seconds) FROM history WHERE ts>=? AND ts<?", a, a + 86400)})
+    out["days"] = days
+    out["top_songs"] = [dict(r) for r in conn.execute(
+        "SELECT t.id, p.count AS plays FROM plays p JOIN tracks t ON t.id=p.track_id "
+        "WHERE t.missing=0 AND p.count>0 ORDER BY p.count DESC, p.last_played DESC LIMIT 10")]
+    out["top_artists"] = [dict(r) for r in conn.execute(
+        "SELECT COALESCE(NULLIF(t.artist,''),'Unknown artist') AS artist, SUM(p.count) AS plays, "
+        "COUNT(DISTINCT t.id) AS songs FROM plays p JOIN tracks t ON t.id=p.track_id "
+        "WHERE t.missing=0 AND p.count>0 GROUP BY artist ORDER BY plays DESC LIMIT 8")]
+    hrs = [0] * 24
+    for r in conn.execute("SELECT ts, seconds FROM history WHERE ts>=?", (midnight - 29 * 86400,)):
+        hrs[time.localtime(r["ts"]).tm_hour] += r["seconds"]
+    out["hours"] = hrs
+    conn.close()
+    return jsonify(out)
+
+
+# ---- discord ----
+
+@app.post("/api/discord")
+def api_discord():
+    body = request.get_json(force=True) or {}
+    cfg = load_config()
+    cid = str(cfg.get("discord_client_id") or "").strip()
+    if not cfg.get("discord"):
+        DISCORD.close()
+        return jsonify({"ok": False, "message": "off"})
+    activity = None
+    tid = body.get("id")
+    if tid and body.get("playing"):
+        row = _track_row(int(tid))
+        if row:
+            pos = float(body.get("position") or 0)
+            dur = float(row["duration"] or 0)
+            start_ms = int((time.time() - pos) * 1000)
+            title = (row["title"] or Path(row["filename"]).stem)[:120]
+            activity = {"type": 2, "details": title or "Music",
+                        "state": ("by " + row["artist"])[:120] if row["artist"] else "AURA",
+                        "timestamps": {"start": start_ms, **({"end": start_ms + int(dur * 1000)} if dur else {})},
+                        "assets": {"large_image": "aura", "large_text": (row["album"] or "AURA")[:120]},
+                        "instance": False}
+    ok, msg = DISCORD.update(cid, activity)
+    return jsonify({"ok": ok, "message": msg})
+
+
+# ---- app version & updates ----
+
+@app.get("/api/app/version")
+def api_app_version():
+    info = app_version_info()
+    info["can_install"] = bool(FROZEN and os.name == "nt" and info["repo"])
+    info["background"] = dict(BG)
+    return jsonify(info)
+
+
+@app.get("/api/app/update")
+def api_app_update():
+    try:
+        return jsonify(check_update(force=request.args.get("force") == "1"))
+    except Exception:
+        return jsonify({"available": False, "error": "Couldn't check for updates — are you online?"}), 200
+
+
+@app.post("/api/app/update/install")
+def api_app_update_install():
+    if not (FROZEN and os.name == "nt"):
+        return jsonify({"error": "Updates install only in the installed Windows app."}), 400
+    if UPDATE["state"] in ("downloading", "installing"):
+        return jsonify({"ok": True})
+    res = UPDATE.get("result") or {}
+    url = res.get("url") or ""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not res.get("available") or not url.startswith("https://") or not (
+            host == "github.com" or host.endswith(".githubusercontent.com")):
+        return jsonify({"error": "No update to install — check again first."}), 400
+    threading.Thread(target=_download_and_install, args=(url, res.get("size") or 0), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/app/update/status")
+def api_app_update_status():
+    return jsonify({k: UPDATE[k] for k in ("state", "done", "total", "error")})
+
+
+@app.post("/api/player/favorite")
+def api_player_favorite():
+    body = request.get_json(force=True) or {}
+    ids = [int(i) for i in (body.get("ids") or [])]
+    on = bool(body.get("on", True))
+    conn = db()
+    for tid in ids:
+        if on:
+            conn.execute("INSERT OR IGNORE INTO favorites (track_id, added) VALUES (?,?)",
+                         (tid, time.time()))
+        else:
+            conn.execute("DELETE FROM favorites WHERE track_id=?", (tid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "n": len(ids), "on": on})
+
+
+def _playlist_rows(conn):
+    out = []
+    for p in conn.execute("SELECT * FROM playlists ORDER BY updated DESC, id DESC"):
+        ids = [r["track_id"] for r in conn.execute(
+            "SELECT i.track_id FROM playlist_items i JOIN tracks t ON t.id=i.track_id "
+            "WHERE i.playlist_id=? AND t.missing=0 ORDER BY i.pos", (p["id"],))]
+        out.append({"id": p["id"], "name": p["name"], "created": p["created"],
+                    "updated": p["updated"], "track_ids": ids})
+    return out
+
+
+@app.get("/api/playlists")
+def api_playlists():
+    conn = db()
+    rows = _playlist_rows(conn)
+    conn.close()
+    return jsonify({"playlists": rows})
+
+
+def _touch(conn, pid):
+    conn.execute("UPDATE playlists SET updated=? WHERE id=?", (time.time(), pid))
+
+
+def _append(conn, pid, ids):
+    have = {r["track_id"] for r in conn.execute(
+        "SELECT track_id FROM playlist_items WHERE playlist_id=?", (pid,))}
+    pos = conn.execute("SELECT COALESCE(MAX(pos), -1) m FROM playlist_items WHERE playlist_id=?",
+                       (pid,)).fetchone()["m"]
+    added = 0
+    for tid in ids:
+        if tid in have:
+            continue
+        if not conn.execute("SELECT 1 FROM tracks WHERE id=?", (tid,)).fetchone():
+            continue
+        pos += 1
+        conn.execute("INSERT INTO playlist_items (playlist_id, track_id, pos) VALUES (?,?,?)",
+                     (pid, tid, pos))
+        have.add(tid)
+        added += 1
+    return added
+
+
+@app.post("/api/playlists/create")
+def api_playlists_create():
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()[:120]
+    if not name:
+        return jsonify({"error": "Give the playlist a name"}), 400
+    now = time.time()
+    conn = db()
+    cur = conn.execute("INSERT INTO playlists (name, created, updated) VALUES (?,?,?)",
+                       (name, now, now))
+    pid = cur.lastrowid
+    added = _append(conn, pid, [int(i) for i in (body.get("ids") or [])])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "id": pid, "name": name, "added": added})
+
+
+@app.post("/api/playlists/<int:pid>/rename")
+def api_playlists_rename(pid):
+    name = ((request.get_json(force=True) or {}).get("name") or "").strip()[:120]
+    if not name:
+        return jsonify({"error": "Give the playlist a name"}), 400
+    conn = db()
+    conn.execute("UPDATE playlists SET name=? WHERE id=?", (name, pid))
+    _touch(conn, pid)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "name": name})
+
+
+@app.post("/api/playlists/<int:pid>/delete")
+def api_playlists_delete(pid):
+    conn = db()
+    conn.execute("DELETE FROM playlist_items WHERE playlist_id=?", (pid,))
+    conn.execute("DELETE FROM playlists WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/playlists/<int:pid>/add")
+def api_playlists_add(pid):
+    ids = [int(i) for i in ((request.get_json(force=True) or {}).get("ids") or [])]
+    conn = db()
+    if not conn.execute("SELECT 1 FROM playlists WHERE id=?", (pid,)).fetchone():
+        conn.close()
+        return jsonify({"error": "That playlist no longer exists"}), 404
+    added = _append(conn, pid, ids)
+    _touch(conn, pid)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "added": added, "skipped": len(ids) - added})
+
+
+@app.post("/api/playlists/<int:pid>/remove")
+def api_playlists_remove(pid):
+    ids = [int(i) for i in ((request.get_json(force=True) or {}).get("ids") or [])]
+    conn = db()
+    for tid in ids:
+        conn.execute("DELETE FROM playlist_items WHERE playlist_id=? AND track_id=?", (pid, tid))
+    _touch(conn, pid)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/playlists/<int:pid>/order")
+def api_playlists_order(pid):
+    """Save a new order. Ids not mentioned keep their place after the ones given."""
+    ids = [int(i) for i in ((request.get_json(force=True) or {}).get("ids") or [])]
+    conn = db()
+    current = [r["track_id"] for r in conn.execute(
+        "SELECT track_id FROM playlist_items WHERE playlist_id=? ORDER BY pos", (pid,))]
+    present = set(current)
+    order = [i for i in ids if i in present]
+    seen = set(order)
+    order += [i for i in current if i not in seen]
+    for pos, tid in enumerate(order):
+        conn.execute("UPDATE playlist_items SET pos=? WHERE playlist_id=? AND track_id=?",
+                     (pos, pid, tid))
+    _touch(conn, pid)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/reveal/<int:tid>")
+def api_reveal(tid):
+    conn = db()
+    row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(row["path"])])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", row["path"]])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(row["path"])])
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True})
+
+
+@app.get("/api/export")
+def api_export():
+    import csv
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM tracks WHERE missing=0 ORDER BY artist, title")]
+    conn.close()
+    cols = ["rating", "title", "artist", "albumartist", "album", "year", "genre",
+            "producer", "bpm", "music_key", "duration", "user_tags", "notes",
+            "filename", "path"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        r["duration"] = round(r.get("duration") or 0, 1)
+        w.writerow(r)
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=library.csv"})
+
+
+LAST_PING = {"t": time.time()}
+
+
+@app.post("/api/ping")
+def api_ping():
+    LAST_PING["t"] = time.time()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/quit")
+def api_quit():
+    threading.Timer(0.3, lambda: os._exit(0)).start()
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# launching
+# --------------------------------------------------------------------------
+
+def watchdog(grace=90):
+    while True:
+        time.sleep(15)
+        if SCAN_STATE["running"]:
+            LAST_PING["t"] = time.time()
+            continue
+        if time.time() - LAST_PING["t"] > grace:
+            os._exit(0)
+
+
+def hide_console():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def free_port(preferred=7788):
+    for port in (preferred, 0):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+            p = s.getsockname()[1]
+            s.close()
+            return p
+        except OSError:
+            s.close()
+    return preferred
+
+
+def find_browser():
+    if os.name != "nt":
+        for name in ("chromium", "google-chrome", "chromium-browser", "microsoft-edge"):
+            p = shutil.which(name)
+            if p:
+                return p
+        return None
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    for c in [os.path.join(pf86, r"Microsoft\Edge\Application\msedge.exe"),
+              os.path.join(pf, r"Microsoft\Edge\Application\msedge.exe"),
+              os.path.join(pf, r"Google\Chrome\Application\chrome.exe"),
+              os.path.join(pf86, r"Google\Chrome\Application\chrome.exe"),
+              os.path.join(local, r"Google\Chrome\Application\chrome.exe")]:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def open_window(url):
+    exe = find_browser()
+    if exe:
+        try:
+            subprocess.Popen([exe, "--app=%s" % url,
+                              "--user-data-dir=%s" % str(DATA_DIR / "window"),
+                              "--no-first-run", "--no-default-browser-check",
+                              "--window-size=1500,940"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except Exception:
+            pass
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def existing_instance(port):
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/scan/status" % port,
+                                    timeout=1.5) as r:
+            json.loads(r.read().decode("utf-8"))
+            return True
+    except Exception:
+        return False
+
+
+def fatal(msg):
+    try:
+        (DATA_DIR / "error.log").write_text(msg, encoding="utf-8")
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg[:1500],
+                                             "%s could not start" % APP_NAME, 0x10)
+            return
+        except Exception:
+            pass
+    sys.stderr.write(msg + "\n")
+
+
+def selftest():
+    lines = ["%s self-test" % APP_NAME, "-" * 40]
+    ok = True
+    lines.append("version           : %s" % app_version_info()["version"])
+    lines.append("frozen build      : %s" % FROZEN)
+    lines.append("python            : %s" % sys.version.split()[0])
+    lines.append("data dir          : %s" % DATA_DIR)
+    try:
+        init_db()
+        conn = db()
+        n = conn.execute("SELECT COUNT(*) c FROM tracks").fetchone()["c"]
+        conn.close()
+        lines.append("database          : ok (%d tracks)" % n)
+    except Exception as exc:
+        ok = False
+        lines.append("database          : FAILED %s" % exc)
+    tpl = resource_dir() / "templates" / "index.html"
+    if tpl.exists():
+        lines.append("interface         : ok (%d KB)" % (tpl.stat().st_size // 1024))
+    else:
+        ok = False
+        lines.append("interface         : FAILED missing %s" % tpl)
+    lines.append("numpy             : %s" % (np.__version__ if np is not None else "MISSING"))
+    if np is None:
+        ok = False
+    if _sf is not None:
+        lines.append("audio decoding    : libsndfile %s, mp3=%s"
+                     % (_sf.__libsndfile_version__, "MP3" in _sf.available_formats()))
+    elif FFMPEG:
+        lines.append("audio decoding    : ffmpeg at %s" % FFMPEG)
+    else:
+        lines.append("audio decoding    : none - fingerprinting disabled")
+    lines.append("fingerprinting    : %s" % ("available" if CAN_FINGERPRINT else "unavailable"))
+    lines.append("cpu workers       : %d" % max(2, min(8, os.cpu_count() or 4)))
+    try:
+        lines.append("networking        : ok (can bind 127.0.0.1:%d)" % free_port())
+    except Exception as exc:
+        ok = False
+        lines.append("networking        : FAILED %s" % exc)
+    b = find_browser()
+    lines.append("app window        : %s" % (b if b else "no Edge/Chrome found - will use your default browser"))
+    lines.append("-" * 40)
+    lines.append("RESULT: %s" % ("OK" if ok else "PROBLEMS FOUND"))
+    report = "\n".join(lines)
+    print(report)
+    try:
+        (DATA_DIR / "selftest.txt").write_text(report, encoding="utf-8")
+    except Exception:
+        pass
+    return 0 if ok else 1
+
+
+def main():
+    global ALLOWED_ORIGINS
+    init_db()
+    if not CONFIG_PATH.exists():
+        save_config(load_config())
+
+    fixed = int(os.environ.get("PORT") or 0)
+    if not fixed and existing_instance(7788):
+        print("%s is already running - opening that window." % APP_NAME)
+        open_window("http://127.0.0.1:7788/")
+        return
+    port = fixed or free_port()
+    ALLOWED_ORIGINS = {"http://127.0.0.1:%d" % port, "http://localhost:%d" % port}
+    url = "http://127.0.0.1:%d/" % port
+
+    print("\n  %s is running at %s" % (APP_NAME, url))
+    print("  Library and settings: %s" % DATA_DIR)
+    print("  Close this window to quit.\n")
+
+    if os.environ.get("NO_BROWSER") != "1":
+        threading.Timer(1.0, lambda: open_window(url)).start()
+    threading.Thread(target=folder_watcher, daemon=True).start()
+    threading.Thread(target=background_worker, daemon=True).start()
+    if FROZEN and os.environ.get("UNRELEASED_WATCHDOG") != "0":
+        LAST_PING["t"] = time.time() + 30
+        threading.Thread(target=watchdog, daemon=True).start()
+        threading.Timer(3.0, hide_console).start()
+
+    from werkzeug.serving import make_server
+    srv = make_server("127.0.0.1", port, app, threaded=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        if "--selftest" in sys.argv:
+            raise SystemExit(selftest())
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        fatal("Something went wrong while starting up.\n\n" + traceback.format_exc()
+              + "\nSettings folder: %s" % DATA_DIR)
+        raise SystemExit(1)

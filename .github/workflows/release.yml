@@ -1,0 +1,76 @@
+# Builds AURA.exe and AURA-Setup.exe on a Windows machine and publishes them
+# as a GitHub Release. Every installed copy of AURA checks the latest release
+# when it opens and offers to update itself.
+#
+# To release:   git tag v1.1.0   then   git push origin v1.1.0
+# (Or: GitHub -> Actions -> "Release AURA" -> Run workflow, for a test build
+#  that is uploaded as an artifact but not published.)
+
+name: Release AURA
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stamp the version and update source into the app
+        shell: pwsh
+        run: |
+          python -c "import json,os; t=os.environ['GITHUB_REF_TYPE']; r=os.environ['GITHUB_REF_NAME']; v=r.lstrip('vV') if t=='tag' else '0.0.0-test'; json.dump({'version':v,'repo':os.environ['GITHUB_REPOSITORY']}, open('version.json','w')); open(os.environ['GITHUB_ENV'],'a').write('AURA_VERSION='+v+'\n'); print('Building AURA', v)"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build AURA.exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile
+          --name AURA --icon icon.ico
+          --add-data "templates;templates"
+          --add-data "version.json;."
+          --collect-all soundfile
+          --hidden-import _cffi_backend
+          app.py
+
+      - name: Self-test the exe
+        run: dist\AURA.exe --selftest
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:AURA_VERSION" installer.iss
+
+      - name: Keep the files from a test run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AURA-${{ env.AURA_VERSION }}
+          path: |
+            dist/AURA-Setup.exe
+            dist/AURA.exe
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AURA ${{ env.AURA_VERSION }}
+          generate_release_notes: true
+          files: |
+            dist/AURA-Setup.exe
+            dist/AURA.exe
