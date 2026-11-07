@@ -10,22 +10,12 @@ real files in place, and it never deletes anything.
 
 ---
 
-## Running it
-
-Extract the zip, then double-click **`AURA.exe`**. That's the whole
-install — Python, the audio decoder, the database and the interface are all
-inside the one file. Windows 10 or 11, 64-bit.
-
 First launch asks for your music folder. Point it at one and hit
 **Start scanning**.
 
 **SmartScreen.** The first run may show "Windows protected your PC" because the
 file isn't code-signed. Click **More info → Run anyway**. Anyone you send it to
 will see the same thing, so warn them or it looks broken.
-
-**If it won't start**, open a Command Prompt in the folder and run
-`AURA.exe --selftest`. It prints which part failed and writes the same
-report to `%APPDATA%\Unreleased\selftest.txt`.
 
 ---
 
