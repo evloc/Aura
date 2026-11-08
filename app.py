@@ -1462,6 +1462,21 @@ def write_lyrics(path, text, synced=None):
     if synced and not text:
         text = "\n".join(line for _, line in synced)
     ext = Path(path).suffix.lower()
+    if ext in (".wav", ".aif", ".aiff"):      # these carry an ID3 tag inside, same as MP3
+        wf = MutagenFile(path)
+        if wf is None:
+            return False
+        if wf.tags is None:
+            wf.add_tags()
+        wf.tags.delall("USLT")
+        wf.tags.delall("SYLT")
+        if text:
+            wf.tags.add(USLT(encoding=3, lang="eng", desc="", text=text))
+        if synced:
+            wf.tags.add(SYLT(encoding=3, lang="eng", format=2, type=1, desc="",
+                             text=[(line, int(round(t * 1000))) for t, line in synced]))
+        wf.save()
+        return True
     if ext == ".mp3":
         try:
             tags = ID3(path)
@@ -1575,7 +1590,7 @@ def http_text(url, timeout=12, ua=BROWSER_UA):
 
 
 def lrclib_search(q):
-    res = http_json(LRCLIB_URL + "/api/search?" + urllib.parse.urlencode({"q": q}), timeout=10) or []
+    res = http_json(LRCLIB_URL + "/api/search?" + urllib.parse.urlencode({"q": q}), timeout=8) or []
     out = []
     for r in res[:15]:
         if not (r.get("plainLyrics") or r.get("syncedLyrics")):
@@ -1589,7 +1604,8 @@ def lrclib_search(q):
 
 
 def genius_search(q):
-    data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q})))
+    data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q}),
+                                timeout=8))
     out, seen = [], set()
     for sec in (data.get("response") or {}).get("sections") or []:
         for hit in sec.get("hits") or []:
@@ -1668,13 +1684,14 @@ def find_lyrics(row, query=None):
     artist = re.split(r"\s+(?:feat|ft)\.?\s", artist, flags=re.I)[0].strip()
     queries = [query.strip()] if query and query.strip() else [q for q in (
         ("%s %s" % (artist, title)).strip(), title) if q]
-    results, errors = [], []
-    for q in dict.fromkeys(queries):
-        for fn in (lrclib_search, genius_search):
-            try:
-                results += fn(q)
-            except Exception as exc:
-                errors.append("%s: %s" % (fn.__name__.split("_")[0], exc))
+    jobs = []
+    for k, q in enumerate(dict.fromkeys(queries)):
+        jobs += [("lrclib#%d" % k, lrclib_search, q), ("genius#%d" % k, genius_search, q)]
+    got, errors = run_parallel(jobs, limit=9.0)
+    errors = [e.replace("#0", "").replace("#1", "") for e in errors]
+    results = []
+    for name, _, _ in jobs:
+        results += got.get(name) or []
     dur = row["duration"] or 0
     seen, out = set(), []
     for r in results:
@@ -1704,11 +1721,19 @@ AS = {"jobs": [], "lock": threading.Lock(), "wake": threading.Event(), "worker":
 
 
 def autosync_engine():
-    try:
-        import faster_whisper  # noqa: F401
-        return True, ""
-    except Exception as exc:
-        return False, "The speech engine isn't included in this build (%s)." % exc
+    """Is the speech engine there? Checked without loading it (loading takes seconds)."""
+    if AS.get("engine") is None:
+        import importlib.util
+        def there(name):
+            if sys.modules.get(name) is not None:
+                return True
+            try:
+                return importlib.util.find_spec(name) is not None
+            except Exception:
+                return False
+        ok = there("faster_whisper") and (there("ctranslate2") or "faster_whisper" in sys.modules)
+        AS["engine"] = ok
+    return (True, "") if AS["engine"] else (False, "The speech engine isn't included in this build.")
 
 
 def model_dir():
@@ -1717,12 +1742,12 @@ def model_dir():
     return d
 
 
+MODEL_REPOS = {"base": "Systran/faster-whisper-base", "small": "Systran/faster-whisper-small",
+               "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo"}
+
+
 def _model_folder(name):
-    try:
-        from faster_whisper.utils import _MODELS
-        repo = _MODELS.get(name, name)
-    except Exception:
-        repo = "Systran/faster-whisper-" + name
+    repo = MODEL_REPOS.get(name) or ("Systran/faster-whisper-" + name)
     return model_dir() / ("models--" + repo.replace("/", "--"))
 
 
@@ -3612,7 +3637,7 @@ def api_lyrics_get(tid):
     return jsonify({"lyrics": lf["plain"],
                     "synced": [{"t": t, "text": line} for t, line in lf["synced"]] if lf["synced"] else None,
                     "source": lf["source"],
-                    "editable": (row["ext"] or "").lower() in ("mp3", "m4a", "mp4", "aac", "flac", "ogg", "opus")})
+                    "editable": (row["ext"] or "").lower() in ("mp3", "m4a", "mp4", "aac", "flac", "ogg", "opus", "wav", "aif", "aiff")})
 
 
 @app.post("/api/lyrics/<int:tid>")
@@ -3963,61 +3988,87 @@ CAA_URL = "https://coverartarchive.org"
 COVER_HOSTS = ("mzstatic.com", "dzcdn.net", "deezer.com", "genius.com", "coverartarchive.org", "archive.org")
 
 
+def _cov_apple(q):
+    out = []
+    for ent in ("album", "song"):
+        res = http_json(ITUNES_URL + "/search?" + urllib.parse.urlencode(
+            {"term": q, "entity": ent, "limit": 12}), timeout=6).get("results") or []
+        for r in res:
+            u = r.get("artworkUrl100")
+            if u:
+                out.append({"source": "Apple", "url": u.replace("100x100bb", "1000x1000bb"),
+                            "thumb": u.replace("100x100bb", "300x300bb"),
+                            "title": r.get("collectionName") if ent == "album" else r.get("trackName"),
+                            "artist": r.get("artistName") or ""})
+    return out
+
+
+def _cov_deezer(q):
+    res = http_json(DEEZER_URL + "/search/album?" + urllib.parse.urlencode({"q": q, "limit": 15}),
+                    timeout=6).get("data") or []
+    return [{"source": "Deezer", "url": r["cover_xl"], "thumb": r.get("cover_medium") or r["cover_xl"],
+             "title": r.get("title") or "", "artist": (r.get("artist") or {}).get("name") or ""}
+            for r in res if r.get("cover_xl")]
+
+
+def _cov_genius(q):
+    """Fans add cover art for a lot of unreleased songs here."""
+    data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q}),
+                                timeout=6))
+    out = []
+    for sec in (data.get("response") or {}).get("sections") or []:
+        for hit in sec.get("hits") or []:
+            r = hit.get("result") or {}
+            if hit.get("type") not in ("song", "album"):
+                continue
+            u = r.get("song_art_image_url") or r.get("cover_art_url") or ""
+            if u and "default_cover" not in u and "default_avatar" not in u:
+                out.append({"source": "Genius", "url": u,
+                            "thumb": r.get("song_art_image_thumbnail_url") or r.get("cover_art_thumbnail_url") or u,
+                            "title": r.get("title") or r.get("name") or "",
+                            "artist": (r.get("primary_artist") or r.get("artist") or {}).get("name") or ""})
+    return out
+
+
+def _cov_musicbrainz(q):
+    res = http_json(MUSICBRAINZ_URL + "/ws/2/release-group/?" + urllib.parse.urlencode(
+        {"query": q, "fmt": "json", "limit": 10}), timeout=6).get("release-groups") or []
+    return [{"source": "MusicBrainz", "url": "%s/release-group/%s/front-1200" % (CAA_URL, r["id"]),
+             "thumb": "%s/release-group/%s/front-250" % (CAA_URL, r["id"]), "title": r.get("title") or "",
+             "artist": ((r.get("artist-credit") or [{}])[0].get("name") or "")} for r in res]
+
+
+COVER_SOURCES = (("Genius", _cov_genius), ("Apple", _cov_apple), ("Deezer", _cov_deezer), ("MusicBrainz", _cov_musicbrainz))
+NET_POOL = ThreadPoolExecutor(max_workers=12)
+
+
+def run_parallel(jobs, limit=8.0):
+    """jobs: [(name, fn, arg)]. Runs them all at once; anything slower than
+    `limit` seconds is left out instead of holding everything up."""
+    from concurrent.futures import wait
+    futs = {NET_POOL.submit(fn, arg): name for name, fn, arg in jobs}
+    done, late = wait(futs, timeout=limit)
+    results, errors = {}, []
+    for f in done:
+        try:
+            results[futs[f]] = f.result()
+        except Exception as exc:
+            errors.append("%s: %s" % (futs[f], exc))
+    for f in late:
+        errors.append("%s: too slow" % futs[f])
+    return results, errors
+
+
 def cover_search(q):
-    out, errors = [], []
-    try:
-        for ent in ("album", "song"):
-            res = http_json(ITUNES_URL + "/search?" + urllib.parse.urlencode(
-                {"term": q, "entity": ent, "limit": 12}), timeout=8).get("results") or []
-            for r in res:
-                u = r.get("artworkUrl100")
-                if u:
-                    out.append({"source": "Apple", "url": u.replace("100x100bb", "1000x1000bb"),
-                                "thumb": u.replace("100x100bb", "300x300bb"),
-                                "title": r.get("collectionName") if ent == "album" else r.get("trackName"),
-                                "artist": r.get("artistName") or ""})
-    except Exception as exc:
-        errors.append("Apple: %s" % exc)
-    try:
-        res = http_json(DEEZER_URL + "/search/album?" + urllib.parse.urlencode({"q": q, "limit": 15}),
-                        timeout=8).get("data") or []
-        for r in res:
-            if r.get("cover_xl"):
-                out.append({"source": "Deezer", "url": r["cover_xl"], "thumb": r.get("cover_medium") or r["cover_xl"],
-                            "title": r.get("title") or "", "artist": (r.get("artist") or {}).get("name") or ""})
-    except Exception as exc:
-        errors.append("Deezer: %s" % exc)
-    try:   # Genius: fans add cover art for a lot of unreleased songs
-        data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q})))
-        for sec in (data.get("response") or {}).get("sections") or []:
-            for hit in sec.get("hits") or []:
-                r = hit.get("result") or {}
-                if hit.get("type") not in ("song", "album"):
-                    continue
-                u = r.get("song_art_image_url") or r.get("cover_art_url") or ""
-                if u and "default_cover" not in u and "default_avatar" not in u:
-                    out.append({"source": "Genius", "url": u,
-                                "thumb": r.get("song_art_image_thumbnail_url") or r.get("cover_art_thumbnail_url") or u,
-                                "title": r.get("title") or r.get("name") or "",
-                                "artist": (r.get("primary_artist") or r.get("artist") or {}).get("name") or ""})
-    except Exception as exc:
-        errors.append("Genius: %s" % exc)
-    try:   # MusicBrainz + Cover Art Archive
-        res = http_json(MUSICBRAINZ_URL + "/ws/2/release-group/?" + urllib.parse.urlencode(
-            {"query": q, "fmt": "json", "limit": 10}), timeout=8).get("release-groups") or []
-        for r in res:
-            out.append({"source": "MusicBrainz", "url": "%s/release-group/%s/front-1200" % (CAA_URL, r["id"]),
-                        "thumb": "%s/release-group/%s/front-250" % (CAA_URL, r["id"]), "title": r.get("title") or "",
-                        "artist": ((r.get("artist-credit") or [{}])[0].get("name") or "")})
-    except Exception as exc:
-        errors.append("MusicBrainz: %s" % exc)
-    seen, uniq = set(), []
-    for r in out:
-        key = r["thumb"]
-        if key not in seen:
-            seen.add(key)
-            uniq.append(r)
-    return uniq[:60], errors
+    res, errors = run_parallel([(n, fn, q) for n, fn in COVER_SOURCES])
+    lists = [res.get(n) or [] for n, _ in COVER_SOURCES]
+    out, seen = [], set()
+    for i in range(max([len(l) for l in lists] + [0])):      # mix the sources together
+        for l in lists:
+            if i < len(l) and l[i]["thumb"] not in seen:
+                seen.add(l[i]["thumb"])
+                out.append(l[i])
+    return out[:60], errors
 
 
 @app.get("/api/covers/search")

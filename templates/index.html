@@ -2557,8 +2557,9 @@ async function lyricsModal(id){
 }
 function markLyrics(id,has,synced){const t=PMAP.get(id);if(t){t.has_lyrics=has?1:0;t.has_synced=synced?1:0;}}
 async function findLyricsOnline(id){
+  if(document.querySelector('.modal.fnd'))return;
   const t=meta(id);
-  const w=el('div','modal fnd');
+  const w=el('div','modal fnd');const W$=sel=>w.querySelector(sel);
   w.innerHTML='<div class="box" style="max-width:860px;height:84vh"><div class="h">Find lyrics — '+esc(ttl(t))+'</div>'+
     '<div class="qrow"><input class="search" id="fnQ" placeholder="Artist and song name"><button class="btn primary" id="fnGo">Search</button></div>'+
     '<div class="cols"><div class="res" id="fnRes"><div class="empty">Searching…</div></div><div class="pv" id="fnPv"></div></div>'+
@@ -2570,11 +2571,11 @@ async function findLyricsOnline(id){
   const close=()=>{w.remove();window.removeEventListener('keydown',esck,true);};
   const esck=e=>{if(e.key==='Escape'&&document.body.contains(w)){e.preventDefault();e.stopImmediatePropagation();close();}};
   window.addEventListener('keydown',esck,true);
-  $('#fnX').onclick=close;
+  W$('#fnX').onclick=close;
   async function preview(r,row){
     document.querySelectorAll('#fnRes .hit').forEach(x=>x.classList.toggle('on',x===row));
-    pick=null;$('#fnUse').disabled=$('#fnUseAs').disabled=true;
-    const pv=$('#fnPv');
+    pick=null;W$('#fnUse').disabled=W$('#fnUseAs').disabled=true;
+    const pv=W$('#fnPv');
     if(r.lyrics==null&&r.url){
       pv.textContent='Loading from Genius…';const my=++seq;
       try{r.lyrics=(await api('/api/lyrics/genius?url='+encodeURIComponent(r.url))).lyrics;}
@@ -2583,16 +2584,16 @@ async function findLyricsOnline(id){
     }
     pv.textContent=r.synced?r.synced.map(x=>x.text).join('\n'):r.lyrics;
     pv.scrollTop=0;pick=r;
-    $('#fnUse').disabled=false;$('#fnUseAs').disabled=!!r.synced||AS_OK===false;
-    $('#fnUseAs').title=r.synced?'These are already timed to the music':'';
-    $('#fnUse').textContent=r.synced?'Use these (already timed)':'Use these';
+    W$('#fnUse').disabled=false;W$('#fnUseAs').disabled=!!r.synced||AS_OK===false;
+    W$('#fnUseAs').title=r.synced?'These are already timed to the music':'';
+    W$('#fnUse').textContent=r.synced?'Use these (already timed)':'Use these';
   }
   async function search(q){
-    const box=$('#fnRes');box.innerHTML='<div class="empty">Searching…</div>';$('#fnPv').textContent='';
-    pick=null;$('#fnUse').disabled=$('#fnUseAs').disabled=true;
+    const box=W$('#fnRes');box.innerHTML='<div class="empty">Searching…</div>';W$('#fnPv').textContent='';
+    pick=null;W$('#fnUse').disabled=W$('#fnUseAs').disabled=true;
     let r;try{r=await api('/api/lyrics/'+id+'/find'+(q!=null?'?q='+encodeURIComponent(q):''));}
     catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';return;}
-    if(q==null)$('#fnQ').value=r.query||r.default_query||'';
+    if(q==null)W$('#fnQ').value=r.query||r.default_query||'';
     box.innerHTML='';
     if(!r.results.length){
       box.innerHTML='<div class="empty">'+(r.offline?'Couldn\'t reach the lyrics sites — check your internet connection.':
@@ -2607,10 +2608,10 @@ async function findLyricsOnline(id){
       row.onclick=()=>preview(x,row);box.appendChild(row);
       if(i===0)preview(x,row);
     });
-    if(r.errors&&r.errors.length)$('#fnNote').textContent='Some sites didn\'t answer: '+r.errors.map(x=>x.split(':')[0]).join(', ');
+    if(r.errors&&r.errors.length)W$('#fnNote').textContent='Some sites didn\'t answer: '+r.errors.map(x=>x.split(':')[0]).join(', ');
   }
-  $('#fnGo').onclick=()=>search($('#fnQ').value);
-  $('#fnQ').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();search($('#fnQ').value);}};
+  W$('#fnGo').onclick=()=>search(W$('#fnQ').value);
+  W$('#fnQ').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();search(W$('#fnQ').value);}};
   async function use(sync){
     if(!pick)return;
     try{await post('/api/lyrics/'+id,{lyrics:pick.lyrics,synced:pick.synced});}catch(e){toast(e.message,true);return;}
@@ -2620,7 +2621,7 @@ async function findLyricsOnline(id){
     else toast('Lyrics saved'+(pick.synced?' — they\'ll follow the song':''),false,
       pick.synced||AS_OK===false?null:{label:'Auto-sync',fn:()=>startAutosync(id,false)});
   }
-  $('#fnUse').onclick=()=>use(false);$('#fnUseAs').onclick=()=>use(true);
+  W$('#fnUse').onclick=()=>use(false);W$('#fnUseAs').onclick=()=>use(true);
   search(null);
 }
 
@@ -3142,9 +3143,10 @@ function coverQuery(t){
   return (a+' '+(t.album&&t.album.toLowerCase()!==tt.toLowerCase()?t.album:tt)).trim();
 }
 function coverFinder(ids,q,queueIds){
+  if(document.querySelector('.modal.cvf'))return;
   ids=ids.filter(x=>x!=null);if(!ids.length)return;
   const t=meta(ids[0]);
-  const w=el('div','modal cvf');
+  const w=el('div','modal cvf');const W$=sel=>w.querySelector(sel);
   const many=ids.length>1;
   w.innerHTML='<div class="box" style="max-width:860px;height:86vh"><div class="h">Cover art — '+(many?ids.length+' songs':esc(ttl(t)))+
     (queueIds&&queueIds.length>1?' <span class="count">('+queueIds.length+' songs without a cover — one at a time)</span>':'')+'</div>'+
@@ -3171,14 +3173,14 @@ function coverFinder(ids,q,queueIds){
   let pick=null,tab='find';
   // every version of this song can share the cover
   const takes=(!many&&t&&t.song)?PLIB.filter(x=>x.song&&x.song.toLowerCase()===t.song.toLowerCase()&&x.id!==t.id):[];
-  if(takes.length){$('#cvAllV').style.display='';$('#cvAllVt').textContent='Also on the other '+takes.length+' version'+(takes.length>1?'s':'');}
-  const targets=()=>takes.length&&$('#cvAllV input').checked?[...ids,...takes.map(x=>x.id)]:ids;
+  if(takes.length){W$('#cvAllV').style.display='';W$('#cvAllVt').textContent='Also on the other '+takes.length+' version'+(takes.length>1?'s':'');}
+  const targets=()=>takes.length&&W$('#cvAllV input').checked?[...ids,...takes.map(x=>x.id)]:ids;
   const onPaste=e=>{
     if(!document.body.contains(w)){document.removeEventListener('paste',onPaste);return;}
     const items=[...(e.clipboardData||{}).items||[]];const im=items.find(i=>i.type.startsWith('image/'));
     if(im){e.preventDefault();useBlob(im.getAsFile());return;}
     const txt=(e.clipboardData.getData('text')||'').trim();
-    if(/^https?:\/\/\S+$/.test(txt)&&document.activeElement!==$('#cvQ')){e.preventDefault();$('#cvLink').value=txt;useLink(txt);}
+    if(/^https?:\/\/\S+$/.test(txt)&&document.activeElement!==W$('#cvQ')){e.preventDefault();W$('#cvLink').value=txt;useLink(txt);}
   };
   document.addEventListener('paste',onPaste);
   const box=w.querySelector('.box');
@@ -3189,19 +3191,19 @@ function coverFinder(ids,q,queueIds){
     const u=(e.dataTransfer.getData('text/uri-list')||e.dataTransfer.getData('text/plain')||'').split('\n')[0].trim();
     const html=e.dataTransfer.getData('text/html')||'';const m=html.match(/<img[^>]+src="([^"]+)"/i);
     const link=m&&/^https?:/.test(m[1])?m[1]:u;
-    if(/^https?:/.test(link)){$('#cvLink').value=link;useLink(link);}else toast('Drop a picture or an image link',true);});
-  const close=()=>{document.removeEventListener('paste',onPaste);w.remove();};$('#cvX2').onclick=close;
+    if(/^https?:/.test(link)){W$('#cvLink').value=link;useLink(link);}else toast('Drop a picture or an image link',true);});
+  const close=()=>{document.removeEventListener('paste',onPaste);w.remove();};W$('#cvX2').onclick=close;
   w.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{
     if(b.dataset.tab==='file'){fileCover();return;}
     tab=b.dataset.tab;w.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('quiet',x!==b));
-    $('#cvFind').style.display=tab==='find'?'flex':'none';$('#cvMake').style.display=tab==='make'?'flex':'none';
-    $('#cvLib').style.display=tab==='lib'?'flex':'none';
+    W$('#cvFind').style.display=tab==='find'?'flex':'none';W$('#cvMake').style.display=tab==='make'?'flex':'none';
+    W$('#cvLib').style.display=tab==='lib'?'flex':'none';
     pick=null;w.querySelectorAll('.cc').forEach(y=>y.classList.remove('on'));
-    $('#cvUse').disabled=tab!=='make';if(tab==='make')drawMk();if(tab==='lib')libCovers();
-    $('#cvNote').textContent=tab==='make'?'Made right here — nothing is uploaded':tab==='lib'?'Covers already in your library':'Apple Music, Deezer, Genius and MusicBrainz · saved inside the song file';
+    W$('#cvUse').disabled=tab!=='make';if(tab==='make')drawMk();if(tab==='lib')libCovers();
+    W$('#cvNote').textContent=tab==='make'?'Made right here — nothing is uploaded':tab==='lib'?'Covers already in your library':'Apple Music, Deezer, Genius and MusicBrainz · saved inside the song file';
   });
   async function search(qq){
-    const g=$('#cvG');g.innerHTML='<div class="empty">Searching…</div>';pick=null;$('#cvUse').disabled=true;
+    const g=W$('#cvG');g.innerHTML='<div class="empty">Searching…</div>';pick=null;W$('#cvUse').disabled=true;
     let r;try{r=await api('/api/covers/search?q='+encodeURIComponent(qq));}catch(e){g.innerHTML='<div class="empty">'+esc(e.message)+'</div>';return;}
     g.innerHTML='';
     if(!r.results.length){g.innerHTML='<div class="empty">'+(r.offline?'Couldn\'t reach Apple Music or Deezer — check your internet.':
@@ -3209,39 +3211,40 @@ function coverFinder(ids,q,queueIds){
     r.results.forEach(x=>{
       const c=el('div','cc','<img loading="lazy" src="'+esc(x.thumb)+'" alt=""><b>'+esc(x.title||'')+'</b><span>'+esc(x.source)+' · '+esc(x.artist||'')+'</span>');
       c.querySelector('img').onerror=()=>c.remove();
-      c.onclick=()=>{w.querySelectorAll('.cc').forEach(y=>y.classList.toggle('on',y===c));pick=x;$('#cvUse').disabled=false;};
+      c.onclick=()=>{w.querySelectorAll('.cc').forEach(y=>y.classList.toggle('on',y===c));pick=x;W$('#cvUse').disabled=false;};
       c.ondblclick=()=>{pick=x;use();};g.appendChild(c);
     });
   }
-  $('#cvQ').value=q||coverQuery(t);
-  $('#cvGo2').onclick=()=>search($('#cvQ').value);
-  $('#cvQ').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();search($('#cvQ').value);}};
+  W$('#cvQ').value=q||coverQuery(t);
+  W$('#cvGo2').onclick=()=>search(W$('#cvQ').value);
+  W$('#cvQ').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();search(W$('#cvQ').value);}};
   // maker
   const PAL=['#1688ff','#ff3b5c','#8b5cf6','#10b981','#f59e0b','#ec4899','#06b6d4','#ef4444','#64748b','#111827'];
   let mk={st:0,col:PAL[Math.floor(Math.random()*PAL.length)],seed:Math.random()};
-  $('#mkT').value=ttl(t).replace(/\s*[\(\[][^\)\]]*[\)\]]/g,'').trim();$('#mkS').value=(t&&(t.artist||'').split(',')[0])||'';
-  $('#mkSw').innerHTML=PAL.map(c=>'<button style="background:'+c+'" data-c="'+c+'"></button>').join('')+
+  W$('#mkT').value=ttl(t).replace(/\s*[\(\[][^\)\]]*[\)\]]/g,'').trim();W$('#mkS').value=(t&&(t.artist||'').split(',')[0])||'';
+  W$('#mkSw').innerHTML=PAL.map(c=>'<button style="background:'+c+'" data-c="'+c+'"></button>').join('')+
     '<input type="color" id="mkCol" style="width:30px;height:30px;border:0;background:none;padding:0">';
-  $('#mkSw').querySelectorAll('button').forEach(b=>b.onclick=()=>{mk.col=b.dataset.c;drawMk();});
-  $('#mkCol').oninput=e=>{mk.col=e.target.value;drawMk();};
+  W$('#mkSw').querySelectorAll('button').forEach(b=>b.onclick=()=>{mk.col=b.dataset.c;drawMk();});
+  W$('#mkCol').oninput=e=>{mk.col=e.target.value;drawMk();};
   w.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{mk.st=+b.dataset.st;w.querySelectorAll('[data-st]').forEach(x=>x.classList.toggle('quiet',x!==b));drawMk();});
-  $('#mkT').oninput=drawMk;$('#mkS').oninput=drawMk;
-  $('#mkShuffle').onclick=()=>{mk.seed=Math.random();mk.col=PAL[Math.floor(Math.random()*PAL.length)];drawMk();};
-  function drawMk(){drawCover($('#cvC'),$('#mkT').value,$('#mkS').value,mk);$('#cvUse').disabled=false;}
+  W$('#mkT').oninput=drawMk;W$('#mkS').oninput=drawMk;
+  W$('#mkShuffle').onclick=()=>{mk.seed=Math.random();mk.col=PAL[Math.floor(Math.random()*PAL.length)];drawMk();};
+  function drawMk(){drawCover(W$('#cvC'),W$('#mkT').value,W$('#mkS').value,mk);W$('#cvUse').disabled=false;}
   async function done(r){
     if(r.failed&&!r.changed){toast(r.error||'Couldn\'t save the cover',true);return;}
     const tg=targets();
     toast('Cover saved'+(tg.length>1?' on '+(r.changed+(r.extra||0))+' songs':'')+(r.failed?' · '+r.failed+' failed: '+r.error:''),!!r.failed);
-    tg.forEach(id=>{const m=PMAP.get(id);if(m)m.has_art=1;});
-    close();ART_V=Date.now();await load(true);await loadPlayer(true);if(CUR&&ids.includes(CUR.id)){CUR.has_art=1;renderEditor();}
-    if(VIEW==='missing')renderMissing();
+    tg.forEach(id=>{const m=PMAP.get(id);if(m)m.has_art=1;const t2=TRACKS.find(x=>x.id===id);if(t2)t2.has_art=1;});
+    close();ART_V=Date.now();
+    if(CUR&&tg.includes(CUR.id)){CUR.has_art=1;renderEditor();}
+    load(true).then(()=>loadPlayer(true)).then(()=>{if(VIEW==='missing')renderMissing();}).catch(()=>{});
     if(queueIds){const rest=queueIds.filter(x=>!ids.includes(x));if(rest.length)coverFinder(rest.slice(0,1),null,rest);}
   }
   async function use(){
-    const b=$('#cvUse');b.disabled=true;b.textContent='Saving…';
+    const b=W$('#cvUse');b.disabled=true;b.textContent='Saving…';
     try{
       if(tab==='make'){
-        const blob=await new Promise(res=>$('#cvC').toBlob(res,'image/jpeg',0.92));
+        const blob=await new Promise(res=>W$('#cvC').toBlob(res,'image/jpeg',0.92));
         const fd=new FormData();fd.append('image',blob,'cover.jpg');fd.append('ids',JSON.stringify(targets()));
         await done(await api('/api/art/bulk',{method:'POST',body:fd}));
       }else if(pick&&pick.copy)await done(await post('/api/covers/copy',{from:pick.copy,ids:targets()}));
@@ -3257,10 +3260,10 @@ function coverFinder(ids,q,queueIds){
     if(!/^https?:\/\//.test(u)){toast('Paste a link that starts with https://',true);return;}
     try{await done(await post('/api/covers/apply',{url:u,ids:targets(),own_link:true}));}catch(e){toast(e.message,true);}
   }
-  $('#cvLinkGo').onclick=()=>useLink($('#cvLink').value.trim());
-  $('#cvLink').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();useLink($('#cvLink').value.trim());}};
+  W$('#cvLinkGo').onclick=()=>useLink(W$('#cvLink').value.trim());
+  W$('#cvLink').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();useLink(W$('#cvLink').value.trim());}};
   function libCovers(){
-    const g=$('#cvLG');g.innerHTML='';
+    const g=W$('#cvLG');g.innerHTML='';
     const near=[];const seen=new Set(ids);
     const addAll=(list,why)=>list.forEach(x=>{if(x.has_art&&!seen.has(x.id)){seen.add(x.id);near.push([x,why]);}});
     if(t&&t.song)addAll(PLIB.filter(x=>x.song&&x.song.toLowerCase()===t.song.toLowerCase()),'Another version');
@@ -3270,7 +3273,7 @@ function coverFinder(ids,q,queueIds){
     if(!near.length){g.innerHTML='<div class="empty">None of this song\'s versions, album, era or artist have a cover yet.</div>';return;}
     near.slice(0,60).forEach(([x,why])=>{
       const c=el('div','cc','<img loading="lazy" src="/api/art/'+x.id+'" alt=""><b>'+esc(ttl(x))+'</b><span>'+esc(why)+'</span>');
-      c.onclick=()=>{w.querySelectorAll('.cc').forEach(y=>y.classList.toggle('on',y===c));pick={copy:x.id};$('#cvUse').disabled=false;};
+      c.onclick=()=>{w.querySelectorAll('.cc').forEach(y=>y.classList.toggle('on',y===c));pick={copy:x.id};W$('#cvUse').disabled=false;};
       c.ondblclick=()=>{pick={copy:x.id};use();};g.appendChild(c);
     });
   }
@@ -3278,10 +3281,10 @@ function coverFinder(ids,q,queueIds){
     const inp=document.createElement('input');inp.type='file';inp.accept='image/*';
     inp.onchange=()=>useBlob(inp.files[0]);inp.click();
   }
-  $('#cvUse').onclick=use;
+  W$('#cvUse').onclick=use;
   if(queueIds&&queueIds.length>1){const sk=el('button','btn quiet','Skip');sk.onclick=()=>{close();const rest=queueIds.filter(x=>!ids.includes(x));
-    if(rest.length)coverFinder(rest.slice(0,1),null,rest);};$('#cvX2').after(sk);}
-  search($('#cvQ').value);
+    if(rest.length)coverFinder(rest.slice(0,1),null,rest);};W$('#cvX2').after(sk);}
+  search(W$('#cvQ').value);
 }
 let ART_V=0;
 function drawCover(cv,title,sub,o){
@@ -3526,12 +3529,13 @@ function radioTopUp(){
 /* ---------- compare versions ---------- */
 let CMP=null;
 function compareVersions(id){
+  if(document.querySelector('.modal.cmp'))return;
   const t=meta(id);if(!t||!t.song)return;
   const takes=PLIB.filter(x=>x.song&&x.song.toLowerCase()===t.song.toLowerCase()).sort((a,b)=>(a.mtime||0)-(b.mtime||0));
   if(takes.length<2){toast('This song has only one version');return;}
   const wasPlaying=!audio.paused,startAt=audio.currentTime||0;audio.pause();
   const other=takes.find(x=>x.id!==id);
-  const w=el('div','modal cmp');
+  const w=el('div','modal cmp');const W$=sel=>w.querySelector(sel);
   const opt=sel=>takes.map(x=>'<option value="'+x.id+'"'+(x.id===sel?' selected':'')+'>'+esc(x.version_label||ttl(x))+'</option>').join('');
   w.innerHTML='<div class="box" style="max-width:760px"><div class="h">Compare versions — '+esc(t.song)+'</div>'+
     '<div class="sides"><div class="side on" data-s="a"><div class="ab">A</div><img class="art" id="cmArtA"><select class="search" id="cmA">'+opt(id)+'</select></div>'+
@@ -3557,29 +3561,29 @@ function compareVersions(id){
     if(hard||Math.abs(B.currentTime-tb)>0.06)B.currentTime=tb;
     if(!A.paused&&B.paused)B.play().catch(()=>{});
   };
-  const showOff=()=>{$('#cmOff').textContent=Math.abs(CMP.off).toFixed(1)+' s';$('#cmOffW').textContent=CMP.off>=0?'ahead of':'behind';};
+  const showOff=()=>{W$('#cmOff').textContent=Math.abs(CMP.off).toFixed(1)+' s';W$('#cmOffW').textContent=CMP.off>=0?'ahead of':'behind';};
   const sw=to=>{CMP.on=to||(CMP.on==='a'?'b':'a');vol();w.querySelectorAll('.side').forEach(x=>x.classList.toggle('on',x.dataset.s===CMP.on));
     const tb=bTarget();if(CMP.on==='b'&&(tb<0||(B.duration&&tb>B.duration)))toast('Version B doesn\'t have this part',true);};
   w.querySelectorAll('.side').forEach(x=>x.onclick=e=>{if(e.target.tagName!=='SELECT')sw(x.dataset.s);});
-  const playBtn=()=>{$('#cmPlay').innerHTML=A.paused?I.play:I.pause;};
+  const playBtn=()=>{W$('#cmPlay').innerHTML=A.paused?I.play:I.pause;};
   const toggle=()=>{if(A.paused){A.play().catch(()=>{});sync(true);}else{A.pause();B.pause();}setTimeout(playBtn,50);};
-  $('#cmPlay').onclick=toggle;
-  A.ontimeupdate=()=>{$('#cmCur').textContent=tm(A.currentTime);$('#cmDur').textContent=tm(A.duration||0);
-    if(A.duration&&!CMP.seeking)$('#cmSeek').value=1000*A.currentTime/A.duration;};
+  W$('#cmPlay').onclick=toggle;
+  A.ontimeupdate=()=>{W$('#cmCur').textContent=tm(A.currentTime);W$('#cmDur').textContent=tm(A.duration||0);
+    if(A.duration&&!CMP.seeking)W$('#cmSeek').value=1000*A.currentTime/A.duration;};
   A.onended=()=>{B.pause();playBtn();};
-  $('#cmSeek').onpointerdown=()=>CMP.seeking=true;$('#cmSeek').onpointerup=()=>CMP.seeking=false;
-  $('#cmSeek').oninput=e=>{if(A.duration){A.currentTime=A.duration*e.target.value/1000;sync(true);}};
+  W$('#cmSeek').onpointerdown=()=>CMP.seeking=true;W$('#cmSeek').onpointerup=()=>CMP.seeking=false;
+  W$('#cmSeek').oninput=e=>{if(A.duration){A.currentTime=A.duration*e.target.value/1000;sync(true);}};
   CMP.timer=setInterval(()=>{if(!A.paused)sync(false);},200);
   w.querySelectorAll('[data-n]').forEach(b=>b.onclick=()=>{CMP.off=+(CMP.off+parseFloat(b.dataset.n)).toFixed(2);showOff();sync(true);});
   async function align(){
-    $('#cmConf').textContent='Listening…';
-    try{const r=await api('/api/compare/offset?a='+$('#cmA').value+'&b='+$('#cmB').value);if(!CMP||!document.body.contains(w))return;CMP.off=r.offset;showOff();sync(true);
-      $('#cmConf').textContent=r.confidence>=0.35?'lined up':r.confidence>=0.15?'roughly lined up — nudge if needed':'couldn\'t find a match — nudge by hand';}
-    catch(e){if($('#cmConf'))$('#cmConf').textContent='';toast(e.message,true);}
+    W$('#cmConf').textContent='Listening…';
+    try{const r=await api('/api/compare/offset?a='+W$('#cmA').value+'&b='+W$('#cmB').value);if(!CMP||!document.body.contains(w))return;CMP.off=r.offset;showOff();sync(true);
+      W$('#cmConf').textContent=r.confidence>=0.35?'lined up':r.confidence>=0.15?'roughly lined up — nudge if needed':'couldn\'t find a match — nudge by hand';}
+    catch(e){if(W$('#cmConf'))W$('#cmConf').textContent='';toast(e.message,true);}
   }
-  $('#cmAlign').onclick=align;
-  $('#cmA').onchange=()=>{const t0=A.currentTime;load(A,$('#cmA').value,'#cmArtA');A.currentTime=t0;align();};
-  $('#cmB').onchange=()=>{load(B,$('#cmB').value,'#cmArtB');align();};
+  W$('#cmAlign').onclick=align;
+  W$('#cmA').onchange=()=>{const t0=A.currentTime;load(A,W$('#cmA').value,'#cmArtA');A.currentTime=t0;align();};
+  W$('#cmB').onchange=()=>{load(B,W$('#cmB').value,'#cmArtB');align();};
   const keys=e=>{
     if(!document.body.contains(w))return;
     if(e.key==='x'||e.key==='X'||e.key==='Tab'){e.preventDefault();e.stopImmediatePropagation();sw();}
@@ -3588,7 +3592,7 @@ function compareVersions(id){
   };
   window.addEventListener('keydown',keys,true);
   const close=()=>{clearInterval(CMP.timer);A.ontimeupdate=A.onended=A.onloadedmetadata=null;A.pause();B.pause();A.removeAttribute('src');B.removeAttribute('src');window.removeEventListener('keydown',keys,true);w.remove();CMP=null;};
-  $('#cmX').onclick=close;
+  W$('#cmX').onclick=close;
   A.onloadedmetadata=()=>{A.currentTime=Math.min(startAt,(A.duration||1)-1);if(wasPlaying){A.play().catch(()=>{});sync(true);setTimeout(playBtn,80);}A.onloadedmetadata=null;};
   showOff();align();
 }
@@ -3651,7 +3655,8 @@ $('#trkGo').onclick=()=>{const u=$('#trkUrl').value.trim();if(!u){toast('Paste a
 $('#trkFile').onclick=()=>{const i=document.createElement('input');i.type='file';i.accept='.csv,.xlsx,.xlsm,text/csv';
   i.onchange=()=>{const f=i.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);trackerLoad(fd);};i.click();};
 function trackerMap(r){
-  const w=el('div','modal trk');
+  if(document.querySelector('.modal.trk'))return;
+  const w=el('div','modal trk');const W$=sel=>w.querySelector(sel);
   const sheetIdx=r.headers.indexOf('Sheet');
   const mp=Object.assign({},r.mapping);if(mp.era==null&&sheetIdx>=0)mp.era=sheetIdx;
   w.innerHTML='<div class="box" style="max-width:920px;height:88vh"><div class="h">Import tracker — '+r.count+' rows</div>'+
@@ -3663,7 +3668,7 @@ function trackerMap(r){
     '</div><label class="chk2"><input type="checkbox" id="tkOver"><span>Replace what\'s already filled in <span style="color:var(--faint)">— off: only empty fields</span></span></label></div>'+
     '<div class="f"><span class="count" style="margin-right:auto" id="tkNote"></span><button class="btn" id="tkX">Cancel</button><button class="btn primary" id="tkGo">Match my songs</button></div></div>';
   document.body.appendChild(w);
-  const maps=$('#tkMaps');
+  const maps=W$('#tkMaps');
   TRK_FIELDS.forEach(([k,l])=>{
     const lab=el('label','',esc(l));const sel=document.createElement('select');sel.className='search';
     sel.innerHTML='<option value="">—</option>'+r.headers.map((h,i)=>'<option value="'+i+'"'+(mp[k]===i?' selected':'')+'>'+esc(h)+'</option>').join('');
@@ -3671,18 +3676,18 @@ function trackerMap(r){
   });
   function table(){
     const used=new Set(Object.values(mp).filter(v=>v!=null));
-    $('#tkTbl').innerHTML='<table><tr>'+r.headers.map((h,i)=>'<th class="'+(used.has(i)?'hl':'')+'">'+esc(h)+'</th>').join('')+'</tr>'+
+    W$('#tkTbl').innerHTML='<table><tr>'+r.headers.map((h,i)=>'<th class="'+(used.has(i)?'hl':'')+'">'+esc(h)+'</th>').join('')+'</tr>'+
       r.sample.map(row=>'<tr>'+row.map((c,i)=>'<td class="'+(used.has(i)?'hl':'')+'" title="'+esc(c)+'">'+esc(c)+'</td>').join('')+'</tr>').join('')+'</table>';
   }
   table();
-  $('#tkX').onclick=()=>w.remove();
-  $('#tkGo').onclick=async()=>{
+  W$('#tkX').onclick=()=>w.remove();
+  W$('#tkGo').onclick=async()=>{
     if(mp.name==null){toast('Pick the column with the song names',true);return;}
     const fields=[...w.querySelectorAll('[data-f]')].filter(x=>x.checked).map(x=>x.dataset.f);
-    $('#tkGo').disabled=true;$('#tkNote').textContent='Matching…';
-    let m;try{m=await post('/api/tracker/match',{token:r.token,mapping:mp,fields,overwrite:$('#tkOver').checked});}
-    catch(e){toast(e.message,true);$('#tkGo').disabled=false;$('#tkNote').textContent='';return;}
-    $('#tkGo').disabled=false;$('#tkNote').textContent='';
+    W$('#tkGo').disabled=true;W$('#tkNote').textContent='Matching…';
+    let m;try{m=await post('/api/tracker/match',{token:r.token,mapping:mp,fields,overwrite:W$('#tkOver').checked});}
+    catch(e){toast(e.message,true);W$('#tkGo').disabled=false;W$('#tkNote').textContent='';return;}
+    W$('#tkGo').disabled=false;W$('#tkNote').textContent='';
     if(!m.proposals.length){toast('Nothing to fill in — '+(m.unmatched?m.unmatched+' songs had no match in the tracker':'everything already matches'));return;}
     w.remove();
     toast(m.proposals.length+' songs matched'+(m.unmatched?' · '+m.unmatched+' not in the tracker':''));
@@ -3734,8 +3739,9 @@ async function cvRefresh(){
   }
 }
 function convertDialog(ids){
+  if(document.querySelector('.modal.cv'))return;
   const n=ids?ids.length:(CV&&CV.convertible)||0;
-  const w=el('div','modal cv');
+  const w=el('div','modal cv');const W$=sel=>w.querySelector(sel);
   const kb=CV_PREF.kbps||320,orig=CV_PREF.originals||'move';
   w.innerHTML='<div class="box" style="max-width:520px"><div class="h">Convert '+(ids?n+' selected song'+(n>1?'s':''):'every non-MP3 song ('+n+')')+' to MP3</div>'+
     '<div class="cvopts" id="cvOpts">'+
@@ -3750,14 +3756,14 @@ function convertDialog(ids){
     '</div><div class="cvopts" id="cvRun" style="display:none"><div class="dstat" id="cvMStat">Starting…</div><div class="cvlist" id="cvMList"></div></div>'+
     '<div class="f"><button class="btn" id="cvX">Cancel</button><button class="btn primary" id="cvGo">Convert</button></div></div>';
   document.body.appendChild(w);
-  $('#cvX').onclick=()=>{if(CV&&CV.running){post('/api/convert/cancel',{});}w.remove();};
-  $('#cvGo').onclick=async()=>{
-    const kbps=+$('#cvKb').value,originals=document.querySelector('input[name=cvO]:checked').value;
+  W$('#cvX').onclick=()=>{if(CV&&CV.running){post('/api/convert/cancel',{});}w.remove();};
+  W$('#cvGo').onclick=async()=>{
+    const kbps=+W$('#cvKb').value,originals=document.querySelector('input[name=cvO]:checked').value;
     try{localStorage.setItem('aura.convert',JSON.stringify({kbps,originals}));}catch(e){}
     Object.assign(CV_PREF,{kbps,originals});
     let r;try{r=await post('/api/convert',ids?{ids,kbps,originals}:{all:true,kbps,originals});}catch(e){toast(e.message,true);return;}
-    $('#cvOpts').style.display='none';$('#cvRun').style.display='';
-    $('#cvGo').disabled=true;$('#cvGo').textContent='Converting…';$('#cvX').textContent='Stop';
+    W$('#cvOpts').style.display='none';W$('#cvRun').style.display='';
+    W$('#cvGo').disabled=true;W$('#cvGo').textContent='Converting…';W$('#cvX').textContent='Stop';
     CV_WAS=true;cvRefresh();
   };
 }
@@ -3984,7 +3990,7 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&MENU){closeMenu();return;}
   if(e.key==='Escape'&&!typing){
     if(KARA){karaClose();return;}
-    const m=document.querySelector('.modal');if(m){m.remove();return;}
+    const ms=document.querySelectorAll('.modal');if(ms.length){ms[ms.length-1].remove();return;}
     if(!$('#np').hidden){closeNP();return;}
     if($('#qdrawer').classList.contains('open')){toggleQueue(false);return;}
   }
