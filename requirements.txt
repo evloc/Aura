@@ -4,3 +4,4 @@ numpy>=1.26,<2
 soundfile>=0.12
 faster-whisper>=1.1,<2
 av>=12
+openpyxl>=3.1

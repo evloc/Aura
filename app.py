@@ -179,6 +179,16 @@ CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY, track_id INTEGER, ts REAL, seconds REAL
 );
 CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts);
+-- Marked moments in a song.
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id INTEGER PRIMARY KEY, track_id INTEGER, t REAL, label TEXT DEFAULT '', created REAL
+);
+CREATE INDEX IF NOT EXISTS idx_bookmarks ON bookmarks(track_id);
+-- "The full version of a snippet you have just arrived".
+CREATE TABLE IF NOT EXISTS snippet_alerts (
+    id INTEGER PRIMARY KEY, full_id INTEGER, snippet_ids TEXT, song TEXT, ts REAL,
+    dismissed INTEGER DEFAULT 0
+);
 -- Every time a song starts (for History in the queue).
 CREATE TABLE IF NOT EXISTS play_log (
     id INTEGER PRIMARY KEY, track_id INTEGER, ts REAL
@@ -218,6 +228,8 @@ DEFAULT_CONFIG = {
     # Auto-sync speech model: "base" (fast, ~145 MB), "small" (better, ~480 MB),
     # "large-v3-turbo" (best, ~1.6 GB). Downloaded once, the first time it's used.
     "autosync_model": "small",
+    # Work out BPM and musical key in the background for songs that have none.
+    "detect_bpm_key": True,
     # Values stamped onto every track by the auto-fill tool.
     "defaults": {"artist": "", "albumartist": "", "album": "", "genre": "", "year": ""},
 }
@@ -235,7 +247,8 @@ def init_db():
                           ("lyrics", "TEXT DEFAULT ''"),
                           ("has_synced", "INTEGER DEFAULT 0"),
                           ("gain_db", "REAL"),
-                          ("era", "TEXT DEFAULT ''")]:
+                          ("era", "TEXT DEFAULT ''"),
+                          ("analysed", "INTEGER DEFAULT 0")]:
             if col not in have:
                 conn.execute("ALTER TABLE tracks ADD COLUMN %s %s" % (col, decl))
 
@@ -597,7 +610,7 @@ def write_tags(path, data, write_extras=True):
     for src, dst in {"title": "title", "artist": "artist", "album": "album",
                      "albumartist": "albumartist", "year": "date",
                      "genre": "genre", "track_no": "tracknumber",
-                     "bpm": "bpm"}.items():
+                     "bpm": "bpm", "music_key": "initialkey"}.items():
         val = data.get(src, "")
         try:
             if val:
@@ -904,6 +917,7 @@ def _scan_library(deep=True):
         do_fp = bool(deep and cfg.get("fingerprint", True))
 
         conn = None
+        new_paths = []
         conn = db()
         existing = {os.path.normcase(r["path"]): dict(r)
                     for r in conn.execute("SELECT * FROM tracks")}
@@ -969,6 +983,7 @@ def _scan_library(deep=True):
                         row["user_tags"] = utags or ""
                         row["era"] = era or ""
                         row["first_seen"] = now
+                        new_paths.append(row["path"])
                         conn.execute(
                             "INSERT INTO tracks (%s) VALUES (%s)" %
                             (", ".join(row.keys()), ", ".join("?" for _ in row)),
@@ -980,6 +995,13 @@ def _scan_library(deep=True):
             if key not in alive:
                 conn.execute("UPDATE tracks SET missing=1 WHERE id=?", (prev["id"],))
         conn.commit()
+        if new_paths and existing:
+            try:
+                ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM tracks WHERE path IN (%s)" % ",".join("?" * len(new_paths)), new_paths)]
+                find_snippet_alerts(conn, ids)
+            except Exception:
+                pass
         conn.close()
         SCAN_STATE["message"] = "Scanned %d files." % len(files)
     except Exception as exc:
@@ -992,6 +1014,53 @@ def _scan_library(deep=True):
     finally:
         SCAN_STATE["running"] = False
         SCAN_STATE["finished_at"] = time.time()
+
+
+def is_snippet(row):
+    hay = " ".join(str(row[k] or "") for k in ("filename", "title", "user_tags")).lower()
+    return "snippet" in hay
+
+
+def _base_song(row):
+    return _norm_words(clean_song_title(row["title"] or Path(row["filename"]).stem))
+
+
+def find_snippet_alerts(conn, new_ids=None):
+    """Pair full songs with snippets of the same song that aren't grouped yet.
+    new_ids: only look at these (just-scanned) tracks; None = whole library."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT t.id, t.title, t.filename, t.user_tags, t.artist, v.song AS song FROM tracks t "
+        "LEFT JOIN versions v ON v.track_id=t.id AND v.status='grouped' WHERE t.missing=0")]
+    by = {}
+    for r in rows:
+        b = _base_song(r)
+        if b:
+            by.setdefault(b, []).append(r)
+    known = {r["full_id"] for r in conn.execute("SELECT full_id FROM snippet_alerts")}
+    made = 0
+    for b, group in by.items():
+        snips = [r for r in group if is_snippet(r)]
+        fulls = [r for r in group if not is_snippet(r)]
+        if not snips or not fulls:
+            continue
+        for f in fulls:
+            if new_ids is not None and f["id"] not in new_ids and not any(s_["id"] in new_ids for s_ in snips):
+                continue
+            if f["id"] in known:
+                continue
+            todo = [s_ for s_ in snips if not (s_["song"] and f["song"] and s_["song"].lower() == f["song"].lower())]
+            if not todo:
+                continue
+            fa, sa = _norm_words(f["artist"] or ""), _norm_words(todo[0]["artist"] or "")
+            if fa and sa and fa.split()[0] != sa.split()[0]:
+                continue
+            conn.execute("INSERT INTO snippet_alerts (full_id, snippet_ids, song, ts) VALUES (?,?,?,?)",
+                         (f["id"], json.dumps([s_["id"] for s_ in todo]),
+                          f["song"] or clean_song_title(f["title"] or Path(f["filename"]).stem), time.time()))
+            known.add(f["id"])
+            made += 1
+    conn.commit()
+    return made
 
 
 # --------------------------------------------------------------------------
@@ -1936,7 +2005,109 @@ def measure_gain(path):
     return float(max(-12.0, min(9.0, LEVEL_TARGET_DB - loud)))
 
 
-BG = {"busy": False, "levelled": 0}
+BG = {"busy": False, "levelled": 0, "analysed": 0}
+
+KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+KEY_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+def _stft_mag(x, n=2048, hop=512):
+    if x is None or len(x) < n * 4:
+        return None
+    frames = 1 + (len(x) - n) // hop
+    win = np.hanning(n).astype(np.float32)
+    out = []
+    for i in range(0, frames, 256):
+        idx = np.arange(n)[None, :] + hop * np.arange(i, min(frames, i + 256))[:, None]
+        out.append(np.abs(np.fft.rfft(x[idx] * win, axis=1)).astype(np.float32))
+    return np.vstack(out)
+
+
+def onset_envelope(x, sr, hop=256):
+    S = _stft_mag(x, 1024, hop)
+    if S is None:
+        return None
+    S = np.log1p(S * 10)
+    flux = np.maximum(0, np.diff(S, axis=0)).sum(axis=1)
+    flux -= np.convolve(flux, np.ones(16) / 16, mode="same")
+    return np.maximum(flux, 0).astype(np.float32)
+
+
+def detect_bpm(x, sr):
+    flux = onset_envelope(x, sr)
+    if flux is None or len(flux) < 300:
+        return None
+    fps = sr / 256.0
+    flux = flux - flux.mean()
+    n = len(flux)
+    ac = np.fft.irfft(np.abs(np.fft.rfft(flux, 2 * n)) ** 2)[:n]
+    if not ac[0]:
+        return None
+    ac /= ac[0]
+
+    def score(bpm):
+        lag = 60 * fps / bpm
+        tot = 0.0
+        for k, w in ((1, 1.0), (2, 0.5), (4, 0.25)):
+            l = lag * k
+            if l < n - 1:
+                i = int(l)
+                f = l - i
+                tot += w * (ac[i] * (1 - f) + ac[i + 1] * f)
+        return tot
+
+    best = max(np.arange(60, 200.5, 0.5),
+               key=lambda b: score(b) * (0.4 + 0.6 * np.exp(-0.5 * (np.log2(b / 120.0) / 0.5) ** 2)))
+    best = max(np.arange(best - 1, best + 1.01, 0.1), key=score)
+    while best < 70:
+        best *= 2
+    while best > 180:
+        best /= 2
+    return int(round(best))
+
+
+def detect_key(x, sr):
+    S = _stft_mag(x, 4096, 2048)
+    if S is None:
+        return None
+    freqs = np.fft.rfftfreq(4096, 1.0 / sr)
+    sel = (freqs > 55) & (freqs < 2000)
+    pc = ((np.round(12 * np.log2(freqs[sel] / 440.0)) + 9) % 12).astype(int)
+    E = S[:, sel] ** 2
+    E = E / (E.sum(axis=1, keepdims=True) + 1e-9)
+    tot = E.sum(axis=0)
+    chroma = np.array([tot[pc == k].sum() for k in range(12)])
+    if chroma.sum() <= 0:
+        return None
+    best, best_r = None, -9.0
+    for i in range(12):
+        for prof, minor in ((KS_MAJOR, False), (KS_MINOR, True)):
+            r = float(np.corrcoef(chroma, np.roll(np.array(prof), i))[0, 1])
+            if r > best_r:
+                best, best_r = (i, minor), r
+    return KEY_NAMES[best[0]] + ("m" if best[1] else "")
+
+
+def analyse_bpm_key(row):
+    """Fill BPM and key where they're empty. Writes them into the file too."""
+    need_bpm = not str(row["bpm"] or "").strip()
+    need_key = not str(row["music_key"] or "").strip()
+    out = {}
+    if not (need_bpm or need_key) or not os.path.exists(row["path"]):
+        return out
+    x = decode_mono(row["path"], target_sr=11025, max_seconds=240)
+    if x is None or len(x) < 11025 * 8:
+        return out
+    if need_bpm:
+        b = detect_bpm(x, 11025)
+        if b:
+            out["bpm"] = str(b)
+    if need_key:
+        k = detect_key(x, 11025)
+        if k:
+            out["music_key"] = k
+    return out
 
 
 def background_worker(once=False):
@@ -1973,6 +2144,33 @@ def background_worker(once=False):
                     c2.close()
                     BG["levelled"] += 1
                 continue
+            if load_config().get("detect_bpm_key", True) and not SCAN_STATE["running"] and not CONV["running"]:
+                c3 = db()
+                todo = c3.execute("SELECT * FROM tracks WHERE missing=0 AND COALESCE(analysed,0)=0 LIMIT 4").fetchall()
+                c3.close()
+                if todo:
+                    BG["busy"] = True
+                    for r in todo:
+                        try:
+                            found = analyse_bpm_key(r)
+                        except Exception:
+                            found = {}
+                        c2 = db()
+                        if found:
+                            merged = dict(r)
+                            merged.update(found)
+                            try:
+                                write_tags(r["path"], merged, load_config().get("write_tags_to_file", True))
+                                _touch_file(c2, r["id"], r["path"])
+                            except Exception:
+                                pass
+                            c2.execute("UPDATE tracks SET %s WHERE id=?" % ", ".join("%s=?" % k for k in found),
+                                       (*found.values(), r["id"]))
+                        c2.execute("UPDATE tracks SET analysed=1 WHERE id=?", (r["id"],))
+                        c2.commit()
+                        c2.close()
+                        BG["analysed"] += 1
+                    continue
             BG["busy"] = False
             if once:
                 return
@@ -2648,7 +2846,7 @@ def _set_config(body):
     for key in ("folders", "quarantine", "rename_pattern",
                 "write_tags_to_file", "fingerprint", "watch_folders",
                 "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
-                "autosync_model"):
+                "autosync_model", "detect_bpm_key"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -3337,6 +3535,7 @@ def api_player_library():
         "SELECT t.id, t.title, t.artist, t.album, t.filename, t.folder, t.duration, "
         "t.has_art, t.first_seen, t.mtime, t.rating, t.year, t.genre, t.track_no, t.albumartist, "
         "t.gain_db, t.has_synced, (COALESCE(t.lyrics,'')<>'') AS has_lyrics, COALESCE(t.era,'') AS era, "
+        "t.producer, t.bpm, t.music_key, "
         "f.track_id IS NOT NULL AS favorite, f.added AS fav_added, "
         "v.song AS song, v.label AS version_label, "
         "COALESCE(pc.count, 0) AS plays, pc.last_played AS last_played "
@@ -3674,6 +3873,16 @@ def api_discord():
 
 # ---- app version & updates ----
 
+@app.get("/api/bg/status")
+def api_bg_status():
+    conn = db()
+    r = conn.execute("SELECT SUM(gain_db IS NULL) AS level_left, SUM(COALESCE(analysed,0)=0) AS bpm_left, "
+                     "SUM(TRIM(COALESCE(bpm,''))<>'') AS with_bpm, SUM(TRIM(COALESCE(music_key,''))<>'') AS with_key, "
+                     "COUNT(*) AS total FROM tracks WHERE missing=0").fetchone()
+    conn.close()
+    return jsonify({k: (r[k] or 0) for k in r.keys()})
+
+
 @app.get("/api/app/version")
 def api_app_version():
     info = app_version_info()
@@ -3749,7 +3958,9 @@ def _touch_file(conn, tid, path):
 # ---- cover art finder ----
 
 DEEZER_URL = "https://api.deezer.com"
-COVER_HOSTS = ("mzstatic.com", "dzcdn.net", "deezer.com")
+MUSICBRAINZ_URL = "https://musicbrainz.org"
+CAA_URL = "https://coverartarchive.org"
+COVER_HOSTS = ("mzstatic.com", "dzcdn.net", "deezer.com", "genius.com", "coverartarchive.org", "archive.org")
 
 
 def cover_search(q):
@@ -3776,13 +3987,37 @@ def cover_search(q):
                             "title": r.get("title") or "", "artist": (r.get("artist") or {}).get("name") or ""})
     except Exception as exc:
         errors.append("Deezer: %s" % exc)
+    try:   # Genius: fans add cover art for a lot of unreleased songs
+        data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q})))
+        for sec in (data.get("response") or {}).get("sections") or []:
+            for hit in sec.get("hits") or []:
+                r = hit.get("result") or {}
+                if hit.get("type") not in ("song", "album"):
+                    continue
+                u = r.get("song_art_image_url") or r.get("cover_art_url") or ""
+                if u and "default_cover" not in u and "default_avatar" not in u:
+                    out.append({"source": "Genius", "url": u,
+                                "thumb": r.get("song_art_image_thumbnail_url") or r.get("cover_art_thumbnail_url") or u,
+                                "title": r.get("title") or r.get("name") or "",
+                                "artist": (r.get("primary_artist") or r.get("artist") or {}).get("name") or ""})
+    except Exception as exc:
+        errors.append("Genius: %s" % exc)
+    try:   # MusicBrainz + Cover Art Archive
+        res = http_json(MUSICBRAINZ_URL + "/ws/2/release-group/?" + urllib.parse.urlencode(
+            {"query": q, "fmt": "json", "limit": 10}), timeout=8).get("release-groups") or []
+        for r in res:
+            out.append({"source": "MusicBrainz", "url": "%s/release-group/%s/front-1200" % (CAA_URL, r["id"]),
+                        "thumb": "%s/release-group/%s/front-250" % (CAA_URL, r["id"]), "title": r.get("title") or "",
+                        "artist": ((r.get("artist-credit") or [{}])[0].get("name") or "")})
+    except Exception as exc:
+        errors.append("MusicBrainz: %s" % exc)
     seen, uniq = set(), []
     for r in out:
         key = r["thumb"]
         if key not in seen:
             seen.add(key)
             uniq.append(r)
-    return uniq[:36], errors
+    return uniq[:60], errors
 
 
 @app.get("/api/covers/search")
@@ -3797,15 +4032,21 @@ def api_covers_search():
 @app.post("/api/covers/apply")
 def api_covers_apply():
     body = request.get_json(force=True) or {}
-    url = body.get("url") or ""
+    url = (body.get("url") or "").strip()
     host = urllib.parse.urlparse(url).hostname or ""
-    if not url.startswith("https://") or not any(host == h or host.endswith("." + h) for h in COVER_HOSTS):
+    own_link = bool(body.get("own_link"))      # a link the user pasted themselves
+    if not url.startswith(("https://", "http://") if own_link else ("https://",)) or not host or (
+            not own_link and not any(host == h or host.endswith("." + h) for h in COVER_HOSTS)):
         return jsonify({"error": "That picture can't be used"}), 400
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA if own_link else HTTP_UA,
+                                                   "Accept": "image/*,*/*;q=0.5"})
         with urllib.request.urlopen(req, timeout=20) as r:
             mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
             data = r.read(12_000_000)
+        if mime in ("application/octet-stream", "binary/octet-stream"):
+            mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else (
+                "image/jpeg" if data[:3] == b"\xff\xd8\xff" else "image/webp" if data[8:12] == b"WEBP" else mime)
     except Exception as exc:
         return jsonify({"error": "Couldn't download the picture: %s" % exc}), 502
     if not mime.startswith("image/") or len(data) < 500:
@@ -3827,6 +4068,485 @@ def api_covers_apply():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "changed": done, "failed": failed, "error": err})
+
+
+@app.post("/api/covers/copy")
+def api_covers_copy():
+    """Use the cover of one song on others (e.g. every version of a song)."""
+    body = request.get_json(force=True) or {}
+    src = _track_row(int(body.get("from") or 0))
+    if not src:
+        return jsonify({"error": "missing"}), 404
+    data, mime = get_artwork(src["path"])
+    if not data:
+        return jsonify({"error": "That song has no cover"}), 400
+    conn = db()
+    done, failed, err = 0, 0, ""
+    for tid in [int(i) for i in body.get("ids") or [] if int(i) != src["id"]]:
+        row = conn.execute("SELECT path FROM tracks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            continue
+        try:
+            set_artwork(row["path"], data, mime)
+            conn.execute("UPDATE tracks SET has_art=1 WHERE id=?", (tid,))
+            _touch_file(conn, tid, row["path"])
+            done += 1
+        except Exception as exc:
+            failed += 1
+            err = str(exc)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "changed": done, "failed": failed, "error": err})
+
+
+# ---- bookmarks ----
+
+@app.get("/api/bookmarks/<int:tid>")
+def api_bookmarks(tid):
+    conn = db()
+    rows = conn.execute("SELECT id, t, label FROM bookmarks WHERE track_id=? ORDER BY t", (tid,)).fetchall()
+    conn.close()
+    return jsonify({"items": [dict(r) for r in rows]})
+
+
+@app.post("/api/bookmarks/<int:tid>")
+def api_bookmarks_add(tid):
+    body = request.get_json(force=True) or {}
+    t = max(0.0, float(body.get("t") or 0))
+    conn = db()
+    if not conn.execute("SELECT 1 FROM tracks WHERE id=?", (tid,)).fetchone():
+        conn.close()
+        return jsonify({"error": "missing"}), 404
+    if conn.execute("SELECT 1 FROM bookmarks WHERE track_id=? AND ABS(t-?)<0.75", (tid, t)).fetchone():
+        conn.close()
+        return jsonify({"error": "There's already a bookmark there"}), 409
+    cur = conn.execute("INSERT INTO bookmarks (track_id, t, label, created) VALUES (?,?,?,?)",
+                       (tid, round(t, 2), (body.get("label") or "").strip()[:80], time.time()))
+    conn.commit()
+    bid = cur.lastrowid
+    conn.close()
+    return jsonify({"ok": True, "id": bid})
+
+
+@app.post("/api/bookmarks/edit")
+def api_bookmarks_edit():
+    body = request.get_json(force=True) or {}
+    conn = db()
+    if body.get("delete"):
+        conn.execute("DELETE FROM bookmarks WHERE id=?", (int(body.get("id") or 0),))
+    else:
+        conn.execute("UPDATE bookmarks SET label=? WHERE id=?", ((body.get("label") or "").strip()[:80], int(body.get("id") or 0)))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+# ---- snippet alerts ----
+
+@app.get("/api/alerts")
+def api_alerts():
+    conn = db()
+    out = []
+    for r in conn.execute("SELECT * FROM snippet_alerts WHERE dismissed=0 ORDER BY ts DESC").fetchall():
+        full = conn.execute("SELECT id, title, filename FROM tracks WHERE id=? AND missing=0", (r["full_id"],)).fetchone()
+        sn = [x for x in (conn.execute("SELECT id, title, filename FROM tracks WHERE id=? AND missing=0", (i,)).fetchone()
+                          for i in json.loads(r["snippet_ids"] or "[]")) if x]
+        if full and sn:
+            out.append({"id": r["id"], "song": r["song"], "ts": r["ts"], "full": dict(full), "snippets": [dict(x) for x in sn]})
+    conn.close()
+    return jsonify({"alerts": out})
+
+
+@app.post("/api/alerts/check")
+def api_alerts_check():
+    conn = db()
+    n = find_snippet_alerts(conn, None)
+    conn.close()
+    return jsonify({"ok": True, "found": n})
+
+
+@app.post("/api/alerts/<int:aid>")
+def api_alerts_act(aid):
+    body = request.get_json(force=True) or {}
+    conn = db()
+    r = conn.execute("SELECT * FROM snippet_alerts WHERE id=?", (aid,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "missing"}), 404
+    grouped = 0
+    if body.get("group"):
+        song = _canon_song(conn, (body.get("song") or r["song"] or "").strip() or "Untitled")
+        for tid, default_label in [(r["full_id"], None)] + [(i, "Snippet") for i in json.loads(r["snippet_ids"] or "[]")]:
+            row = conn.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+            if not row:
+                continue
+            label = version_info(dict(row))[1] or default_label or ""
+            if default_label and "snippet" not in label.lower():
+                label = (label + " · Snippet").strip(" ·") if label else "Snippet"
+            conn.execute("INSERT INTO versions (track_id, song, label, status) VALUES (?,?,?,'grouped') "
+                         "ON CONFLICT(track_id) DO UPDATE SET song=excluded.song, label=excluded.label, status='grouped'",
+                         (tid, song, label))
+            grouped += 1
+    conn.execute("UPDATE snippet_alerts SET dismissed=1 WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "grouped": grouped})
+
+
+# ---- compare versions: line two takes up in time ----
+
+@app.get("/api/compare/offset")
+def api_compare_offset():
+    a, b = _track_row(int(request.args.get("a") or 0)), _track_row(int(request.args.get("b") or 0))
+    if not a or not b:
+        return jsonify({"error": "missing"}), 404
+    sr = 8000
+    xa = decode_mono(a["path"], target_sr=sr, max_seconds=150)
+    xb = decode_mono(b["path"], target_sr=sr, max_seconds=150)
+    if xa is None or xb is None:
+        return jsonify({"offset": 0.0, "confidence": 0.0})
+    def bands(x):
+        S = _stft_mag(x, 1024, 256)
+        if S is None:
+            return None
+        edges = np.unique(np.geomspace(3, S.shape[1] - 1, 9).astype(int))
+        B = np.stack([S[:, a:b].sum(axis=1) for a, b in zip(edges[:-1], edges[1:])], axis=1)
+        B = np.maximum(0, np.diff(np.log1p(B * 10), axis=0))
+        B -= B.mean(axis=0)
+        B /= B.std(axis=0) + 1e-6
+        return B
+    ea, eb = bands(xa), bands(xb)
+    if ea is None or eb is None or len(ea) < 50 or len(eb) < 50:
+        return jsonify({"offset": 0.0, "confidence": 0.0})
+    fps = sr / 256.0
+    n = len(ea) + len(eb)
+    cc = np.zeros(n)
+    for k in range(ea.shape[1]):
+        cc += np.fft.irfft(np.fft.rfft(ea[:, k], n) * np.conj(np.fft.rfft(eb[:, k], n)), n)
+    cc /= ea.shape[1]
+    lags = np.concatenate([np.arange(0, len(ea)), np.arange(-len(eb), 0)])
+    cc = np.concatenate([cc[:len(ea)], cc[n - len(eb):]])
+    lim = int(45 * fps)
+    ok = np.abs(lags) <= lim
+    cc, lags = cc[ok], lags[ok]
+    # Beats repeat, so several lags look alike at this coarse level. Take the best few
+    # and settle it with a fine (1 ms) loudness envelope, where only the true lag lines up.
+    def env(x):
+        e = np.abs(x)
+        e = np.convolve(e, np.ones(8) / 8, mode="same")[::8]      # 1000 per second
+        return np.maximum(0, np.diff(e)).astype(np.float32)
+    fa, fb = env(xa), env(xb)
+
+    def fine(sec):
+        best = (-9.0, sec)
+        k0 = int(round(sec * 1000))
+        for k in range(k0 - 40, k0 + 41):
+            if k >= 0:
+                a, b = fa[k:k + len(fb)], fb
+            else:
+                a, b = fa, fb[-k:]
+            m = min(len(a), len(b))
+            if m < 2000:
+                continue
+            a, b = a[:m], b[:m]
+            sa, sb = a.std(), b.std()
+            if not sa or not sb:
+                continue
+            r = float(((a - a.mean()) * (b - b.mean())).mean() / (sa * sb))
+            if r > best[0]:
+                best = (r, k / 1000.0)
+        return best
+
+    order = np.argsort(cc)[::-1]
+    picks = []
+    for j in order:
+        if all(abs(int(lags[j]) - int(lags[p_])) > fps * 0.3 for p_ in picks):
+            picks.append(j)
+        if len(picks) >= 6:
+            break
+    results = [fine(float(lags[j]) / fps) for j in picks]
+    conf, lag_s = max(results)
+    # a positive lag means A is later: B time = A time - lag
+    return jsonify({"offset": round(-lag_s, 3), "confidence": round(max(0.0, min(1.0, conf)), 3)})
+
+
+# ---- fan tracker import ----
+
+TRACKER = {}          # token -> {"headers": [...], "rows": [[...]], "name": str}
+TRACKER_FIELDS = {
+    "name": ("name", "title", "song", "track"),
+    "era": ("era", "album", "project", "tape", "section", "sheet"),
+    "producer": ("prod", "producer", "producers", "beat"),
+    "recorded": ("recorded", "record date", "recording date", "file date", "session date", "date recorded", "made"),
+    "leaked": ("leak", "leaked", "leak date", "date leaked", "surfaced", "release date", "released"),
+    "notes": ("notes", "note", "description", "info", "details"),
+    "quality": ("quality",),
+    "type": ("type", "status", "availability", "available"),
+    "features": ("feat", "features", "featuring"),
+}
+
+
+def _cell(v):
+    if v is None:
+        return ""
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def load_tracker_bytes(data, name):
+    """CSV or XLSX -> (headers, rows). Every sheet of a workbook is combined,
+    with the sheet's name in a 'Sheet' column (trackers often keep one era per tab)."""
+    low = (name or "").lower()
+    if low.endswith((".xlsx", ".xlsm")) or data[:2] == b"PK":
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        all_rows, headers = [], None
+        for ws in wb.worksheets:
+            rows = [[_cell(c) for c in r] for r in ws.iter_rows(values_only=True)]
+            rows = [r for r in rows if any(r)]
+            if not rows:
+                continue
+            hi = _header_row(rows)
+            h = [x or ("Column %d" % (i + 1)) for i, x in enumerate(rows[hi])]
+            if headers is None:
+                headers = h + ["Sheet"]
+            for r in rows[hi + 1:]:
+                r = (r + [""] * len(h))[:len(h)]
+                # line columns up by header name when tabs differ
+                if h != headers[:-1]:
+                    m = {hh.lower(): v for hh, v in zip(h, r)}
+                    r = [m.get(hh.lower(), "") for hh in headers[:-1]]
+                all_rows.append(r + [ws.title])
+        return headers or [], all_rows
+    import csv
+    text = data.decode("utf-8-sig", "replace")
+    rows = [[c.strip() for c in r] for r in csv.reader(io.StringIO(text))]
+    rows = [r for r in rows if any(r)]
+    if not rows:
+        return [], []
+    hi = _header_row(rows)
+    h = [x or ("Column %d" % (i + 1)) for i, x in enumerate(rows[hi])]
+    return h, [(r + [""] * len(h))[:len(h)] for r in rows[hi + 1:]]
+
+
+def _header_row(rows):
+    """Trackers often have a title banner above the real header row."""
+    best, best_s = 0, -1
+    for i, r in enumerate(rows[:15]):
+        s = sum(1 for c in r for keys in TRACKER_FIELDS.values() if c and any(k in c.lower() for k in keys))
+        if s > best_s:
+            best, best_s = i, s
+    return best
+
+
+def guess_mapping(headers):
+    m = {}
+    for field, keys in TRACKER_FIELDS.items():
+        for i, h in enumerate(headers):
+            hl = h.lower()
+            if i in m.values():
+                continue
+            if any(hl == k or hl.startswith(k) or (" " + k) in hl for k in keys):
+                m[field] = i
+                break
+    return m
+
+
+def tracker_names(name):
+    """'Bad Energy (Wishing Well) [prod. Nick Mira]' -> main title, alt titles, producer, features."""
+    raw = (name or "").replace("\r", "\n")
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    if not lines:
+        return "", [], "", ""
+    first = lines[0]
+    prod = ""
+    m = PROD_RE.search(first)
+    if m:
+        prod = m.group(1).strip(" -–—_.&,")
+        first = (first[:m.start()] + " " + first[m.end():]).strip()
+    feats = ""
+    m = FEAT_RE.search(first)
+    if m:
+        feats = m.group(1).strip(" -–—_.&,")
+        first = (first[:m.start()] + " " + first[m.end():]).strip()
+    alts = []
+    for inner in re.findall(r"[\(\[]([^\)\]]+)[\)\]]", first):
+        if not re.search(r"\b(v\d|ver|version|snippet|og|cdq|hq|lq|leak|session|remix|edit|demo|ref)\b", inner, re.I):
+            alts.extend(a.strip() for a in re.split(r"[,/]| & ", inner) if a.strip())
+    main = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*", " ", first)
+    parts = [p.strip() for p in re.split(r"\s+/\s+", main) if p.strip()]
+    main = parts[0] if parts else main.strip()
+    alts = parts[1:] + alts
+    for l in lines[1:]:
+        l = re.sub(r"^[\(\[]|[\)\]]$", "", l).strip()
+        if l and len(l) < 60:
+            alts.extend(a.strip() for a in re.split(r"[,/]", l) if a.strip())
+    return re.sub(r"\s+", " ", main).strip(" -"), alts, prod, feats
+
+
+def _year_of(s):
+    m = re.search(r"\b(19[6-9]\d|20[0-4]\d)\b", s or "")
+    return m.group(1) if m else ""
+
+
+def match_tracker(entry, mapping, fields, only_ids=None, overwrite=False):
+    headers, rows = entry["headers"], entry["rows"]
+    get = lambda r, f: (r[mapping[f]] if f in mapping and mapping[f] is not None and mapping[f] < len(r) else "")
+    items, cur_era = [], ""
+    has_era_col = "era" in mapping and mapping["era"] is not None
+    for r in rows:
+        name = get(r, "name")
+        others = [c for i, c in enumerate(r) if c and i != mapping.get("name") and headers[i] != "Sheet"]
+        if name and not others and not has_era_col:
+            cur_era = re.sub(r"\s+", " ", name).strip()      # a section heading row
+            continue
+        if not name:
+            continue
+        main, alts, prod, feats = tracker_names(name)
+        if not main:
+            continue
+        era = get(r, "era") or cur_era
+        items.append({"main": main, "alts": alts, "producer": get(r, "producer") or prod,
+                      "features": get(r, "features") or feats, "era": era,
+                      "recorded": get(r, "recorded"), "leaked": get(r, "leaked"), "notes": get(r, "notes"),
+                      "quality": get(r, "quality"), "type": get(r, "type"), "raw": name})
+    index = {}
+    for k, it in enumerate(items):
+        for nm in [it["main"]] + it["alts"]:
+            nn = _norm_words(nm)
+            if nn:
+                index.setdefault(nn, []).append(k)
+    names = list(index)
+    conn = db()
+    tracks = [dict(t) for t in conn.execute("SELECT * FROM tracks WHERE missing=0")]
+    conn.close()
+    if only_ids:
+        tracks = [t for t in tracks if t["id"] in only_ids]
+    from difflib import get_close_matches
+    out, unmatched = [], 0
+    for t in tracks:
+        base = _norm_words(clean_song_title(t["title"] or Path(t["filename"]).stem))
+        if not base:
+            continue
+        score = 1.0
+        cands = index.get(base)
+        if not cands:
+            close = get_close_matches(base, names, n=1, cutoff=0.86)
+            if close:
+                cands = index[close[0]]
+                score = round(SequenceMatcher(None, base, close[0]).ratio(), 3)
+        if not cands:
+            unmatched += 1
+            continue
+        # several rows with the same name (versions): prefer the one whose era matches
+        it = items[cands[0]]
+        if len(cands) > 1 and t.get("era"):
+            for k in cands:
+                if _norm_words(items[k]["era"]) == _norm_words(t["era"]):
+                    it = items[k]
+                    break
+        ch = {}
+
+        def put(f, v):
+            v = (v or "").strip()
+            if v and (overwrite or not str(t.get(f) or "").strip()) and v != (t.get(f) or ""):
+                ch[f] = v
+
+        if "title" in fields:
+            put("title", it["main"] + (" (feat. %s)" % it["features"] if it["features"] else ""))
+        if "era" in fields:
+            put("era", it["era"])
+        if "producer" in fields:
+            put("producer", it["producer"])
+        if "year" in fields:
+            put("year", _year_of(it["recorded"]) or _year_of(it["leaked"]))
+        if "notes" in fields:
+            bits = [("Recorded: " + it["recorded"]) if it["recorded"] else "", ("Leaked: " + it["leaked"]) if it["leaked"] else "",
+                    ("Also known as: " + ", ".join(it["alts"][:4])) if it["alts"] else "", it["notes"]]
+            note = " · ".join(b for b in bits if b)
+            have = (t.get("notes") or "").strip()
+            if note and note not in have:
+                ch["notes"] = (have + "\n" + note).strip() if have else note
+        if "quality" in fields and it["quality"]:
+            tags = [x.strip() for x in (t.get("user_tags") or "").split(",") if x.strip()]
+            q = it["quality"].strip()
+            if q and q.lower() not in {x.lower() for x in tags} and len(q) <= 24:
+                ch["user_tags"] = ", ".join(tags + [q])
+        if ch:
+            out.append({"id": t["id"], "filename": t["filename"], "changes": ch, "score": score,
+                        "matched": it["raw"].split("\n")[0][:120]})
+    out.sort(key=lambda p: (p["score"], p["filename"].lower()))
+    return {"proposals": out, "rows": len(items), "unmatched": unmatched}
+
+
+@app.post("/api/tracker/load")
+def api_tracker_load():
+    data, name = None, ""
+    f = request.files.get("file")
+    if f:
+        data, name = f.read(), f.filename or ""
+    else:
+        url = ((request.get_json(silent=True) or {}).get("url") or "").strip()
+        m = re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", url)
+        if m:
+            name = "sheet.xlsx"
+            url = "https://docs.google.com/spreadsheets/d/%s/export?format=xlsx" % m.group(1)
+        elif not url.startswith("https://"):
+            return jsonify({"error": "Paste a Google Sheets link, or pick a .csv or .xlsx file"}), 400
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                data = r.read(60_000_000)
+                ctype = r.headers.get("Content-Type") or ""
+        except urllib.error.HTTPError as exc:
+            return jsonify({"error": "Couldn't open that sheet (%s). In Google Sheets, Share → General access → "
+                                     "Anyone with the link." % exc.code}), 400
+        except Exception as exc:
+            return jsonify({"error": "Couldn't download it: %s" % exc}), 502
+        if "text/html" in ctype and not name:
+            return jsonify({"error": "That link is a web page, not a spreadsheet"}), 400
+        name = name or url.rsplit("/", 1)[-1]
+    if not data:
+        return jsonify({"error": "That file is empty"}), 400
+    try:
+        headers, rows = load_tracker_bytes(data, name)
+    except Exception as exc:
+        return jsonify({"error": "Couldn't read that spreadsheet: %s" % exc}), 400
+    if not headers or not rows:
+        return jsonify({"error": "No rows found in that spreadsheet"}), 400
+    token = uuid.uuid4().hex[:12]
+    TRACKER.clear()
+    TRACKER[token] = {"headers": headers, "rows": rows, "name": name}
+    return jsonify({"token": token, "headers": headers, "sample": rows[:8], "count": len(rows),
+                    "mapping": guess_mapping(headers)})
+
+
+@app.post("/api/tracker/match")
+def api_tracker_match():
+    body = request.get_json(force=True) or {}
+    entry = TRACKER.get(body.get("token") or "")
+    if not entry:
+        return jsonify({"error": "Load the tracker again"}), 400
+    mapping = {k: (int(v) if v not in (None, "") else None) for k, v in (body.get("mapping") or {}).items()}
+    if mapping.get("name") is None:
+        return jsonify({"error": "Pick the column with the song names"}), 400
+    res = match_tracker(entry, mapping, set(body.get("fields") or []), set(body.get("only") or []) or None,
+                        bool(body.get("overwrite")))
+    return jsonify(res)
+
+
+@app.post("/api/tracker/apply")
+def api_tracker_apply():
+    body = request.get_json(force=True) or {}
+    per = {int(k): {f: v for f, v in ch.items() if f in TAG_FIELDS} for k, ch in (body.get("changes") or {}).items()}
+    per = {k: v for k, v in per.items() if v}
+    conn = db()
+    applied, failed, batch = apply_changes(conn, load_config(), per, "Tracker import: %d songs" % len(per))
+    conn.close()
+    return jsonify({"ok": True, "changed": applied, "failed": failed})
 
 
 # ---- waveform ----

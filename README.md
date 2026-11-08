@@ -112,6 +112,21 @@ cover blurred behind. Click a line to jump there; `Esc` closes it.
 of the part, again at the end, again to stop — or use `[` and `]`, and `\` to
 stop. While a loop is on, an **A–B** chip shows on the player bar.
 
+**Compare versions.** When a song has more than one version, Now Playing's
+Versions row has **Compare…**. Pick version A and B; AURA lines them up by
+listening (a snippet that starts 40 seconds into the song is matched to that
+point) and plays both at once — press `X` (or click A / B) to switch between
+them at the same moment. Nudge the line-up with ±0.1 s / ±1 s if it's off.
+
+**Bookmarks.** Press `B` (or **Bookmark** at the top of Now Playing) to mark a
+moment — a verse, a beat switch. Marks show as small arrows on the waveform and
+in the **Bookmarks** tab, where you can name them and click to jump there.
+
+**Radio.** Turn on **Radio** in the Up next drawer (or Settings → Player): when
+the queue runs out AURA keeps going with similar songs — same era, producer,
+artist or tempo, favoring what you've rated or hearted, and never another take
+of the song that just played.
+
 **History.** Now Playing and the Up next drawer have a **History** tab with the
 last 100 songs you played. Click one to play it now; your queue carries on
 after it.
@@ -294,7 +309,41 @@ songs at once in Library) has three tabs:
 - **Make one** — for unreleased songs with no official art: five styles
   (Glow, Grain, Bold, Minimal, Split), your colour, your text. Made on your PC.
 - **From a file…** — any picture you have.
+- **From your library** — reuse a cover from another version, the same album,
+  era or artist.
+- **Paste / drag / link** — copy a picture anywhere (YouTube, SoundCloud,
+  Instagram…) and press `Ctrl+V` in the window, drag it in, or paste an image
+  link. You can also drop a picture straight onto the cover in the tag editor.
+Search covers Apple Music, Deezer, Genius (fans post art for lots of unreleased
+songs) and MusicBrainz / Cover Art Archive. When a song has other versions,
+tick **Also on the other versions** to give them all the same cover.
 Covers are saved inside the file for MP3, WAV, AIFF, FLAC, M4A, OGG and OPUS.
+
+## Fan tracker import
+
+Tags → **Import a fan tracker**. Paste a Google Sheets link (shared as *Anyone
+with the link*; every tab is read) or pick a `.csv` / `.xlsx`. AURA guesses
+which column is the song name, era, producer, recording date, leak date, notes
+and quality — fix any guess, see the first rows, pick what to fill in (era,
+producer, year, dates and notes, quality as a tag, and optionally the official
+title), then **Match my songs**. Titles are matched after cleaning (`[v2]`,
+`CDQ`, `snippet` and so on are ignored) and against alternate names in the
+tracker, like `Wishing Well (Bad Energy)`. Tabs become the era when there's no
+era column. You review every change before anything is written; it's undoable.
+
+## Snippets that turn up in full
+
+When a rescan finds a full song for which you only had a snippet, AURA tells
+you and offers **Group as versions**. **Versions → Check snippets** looks
+through the whole library for such pairs.
+
+## BPM and key
+
+AURA works out the tempo and musical key of every song that doesn't have them
+yet, quietly in the background, and saves them into the BPM and Key fields
+(and the file). It only fills empty fields. Fast trap beats can come out at
+half or double speed (70 vs 140) — fix any in the tag editor. Turn it off in
+Settings → Sound.
 
 ---
 
@@ -421,7 +470,7 @@ Press `?` in the app for the full list.
 `Space` play / pause · `Ctrl`+`→` / `←` next / previous · `Shift`+`→` / `←`
 skip 10 seconds · `N` Now Playing · `L` lyrics · `Q` Up next · `M` mini player ·
 `Space` (in the sync window) time the next line ·
-`K` full-screen lyrics · `[` `]` loop start / end · `\` stop the loop ·
+`K` full-screen lyrics · `B` bookmark · `X` switch A/B while comparing · `[` `]` loop start / end · `\` stop the loop ·
 `F` favorite · `/` search · `Esc` close a panel · `Ctrl`+`S` save tags ·
 `Ctrl`+`Z` undo · `↑` `↓` move through the Organize list
 
