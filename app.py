@@ -228,6 +228,10 @@ DEFAULT_CONFIG = {
     # Auto-sync speech model: "base" (fast, ~145 MB), "small" (better, ~480 MB),
     # "large-v3-turbo" (best, ~1.6 GB). Downloaded once, the first time it's used.
     "autosync_model": "small",
+    # Language the songs are sung in ("" = let the model guess each time, slower and
+    # sometimes wrong on intros), and the second, precise pass that times every word.
+    "autosync_language": "en",
+    "autosync_precise": True,
     # Work out BPM and musical key in the background for songs that have none.
     "detect_bpm_key": True,
     # Values stamped onto every track by the auto-fill tool.
@@ -1371,6 +1375,90 @@ def to_lrc(lines):
     return "\n".join(rows)
 
 
+WORDS_TAG = "AURA_WORDS"
+_ELRC_LINE = re.compile(r"^\[(\d{1,3}):(\d{1,2}(?:\.\d{1,3})?)\](.*)$")
+_ELRC_WORD = re.compile(r"<(\d{1,3}):(\d{1,2}(?:\.\d{1,3})?)>([^<]*)")
+
+
+def _lrc_ts(t):
+    t = max(0.0, float(t))
+    return "%02d:%05.2f" % (int(t // 60), t - 60 * int(t // 60))
+
+
+def words_to_elrc(synced, words, ends=None):
+    """Word-by-word timings as enhanced LRC: [00:12.30]<00:12.30>I <00:12.52>been <00:13.10>
+    (the last, empty stamp is where the line ends)."""
+    rows = []
+    for i, (t, line) in enumerate(synced):
+        ws = words[i] if words and i < len(words) else None
+        if not ws:
+            rows.append("[%s]" % _lrc_ts(t))
+            continue
+        body = "".join("<%s>%s " % (_lrc_ts(wt), str(w).replace("<", "").replace(">", "")) for wt, w in ws)
+        end = ends[i] if ends and i < len(ends) and ends[i] else None
+        rows.append("[%s]%s%s" % (_lrc_ts(t), body.rstrip(" ") if end is None else body, ("<%s>" % _lrc_ts(end)) if end is not None else ""))
+    return "\n".join(rows)
+
+
+def parse_elrc(text):
+    """-> [(line_t, [(t, word), ...], end or None), ...]"""
+    out = []
+    for raw in (text or "").replace("\r\n", "\n").split("\n"):
+        m = _ELRC_LINE.match(raw.strip())
+        if not m:
+            continue
+        lt = int(m.group(1)) * 60 + float(m.group(2))
+        ws, end = [], None
+        for mm in _ELRC_WORD.finditer(m.group(3)):
+            wt = int(mm.group(1)) * 60 + float(mm.group(2))
+            w = mm.group(3).strip()
+            if w:
+                ws.append((round(wt, 3), w))
+            else:
+                end = round(wt, 3)
+        out.append((round(lt, 3), ws, end))
+    return out
+
+
+def _words_for(synced, raw):
+    """Match stored word timings to the timed lines; anything that no longer fits
+    (the lyrics were edited or re-timed elsewhere) is dropped line by line."""
+    if not synced or not raw:
+        return None, None
+    el = parse_elrc(raw)
+    if len(el) != len(synced):
+        return None, None
+    squash = lambda x: re.sub(r"\s+", " ", x or "").strip()
+    words, ends, any_ = [], [], False
+    for (t, line), (lt, ws, end) in zip(synced, el):
+        if ws and abs(lt - t) < 0.06 and squash(" ".join(w for _, w in ws)) == squash(line):
+            words.append(ws)
+            ends.append(end)
+            any_ = True
+        else:
+            words.append(None)
+            ends.append(None)
+    return (words, ends) if any_ else (None, None)
+
+
+def _read_words_tag(tags):
+    try:
+        if isinstance(tags, ID3):
+            fr = tags.getall("TXXX:" + WORDS_TAG)
+            return str(fr[0].text[0]) if fr and fr[0].text else ""
+        for key in ("----:com.apple.iTunes:" + WORDS_TAG, WORDS_TAG, WORDS_TAG.lower()):
+            try:
+                v = tags.get(key)
+            except Exception:
+                v = None
+            if v:
+                v = v[0] if isinstance(v, list) else v
+                return bytes(v).decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else str(v)
+    except Exception:
+        pass
+    return ""
+
+
 def plain_from_lrc(text):
     keep = []
     for raw in (text or "").replace("\r\n", "\n").split("\n"):
@@ -1399,14 +1487,17 @@ def _read_text_file(p):
 
 
 def read_lyrics_full(path):
-    """{'plain': text, 'synced': [(seconds, line)] or None, 'source': where synced came from}."""
+    """{'plain': text, 'synced': [(seconds, line)] or None, 'source': where synced came from,
+    'words': per line [(seconds, word)] or None, 'ends': per line end time or None}."""
     plain, synced, source = "", None, ""
+    words_raw = ""
     try:
         mf = MutagenFile(path)
     except Exception:
         mf = None
     tags = getattr(mf, "tags", None) if mf is not None else None
     if tags is not None:
+        words_raw = _read_words_tag(tags)
         if isinstance(tags, ID3):
             sy = tags.getall("SYLT")
             if sy:
@@ -1448,20 +1539,26 @@ def read_lyrics_full(path):
                 pass
     if synced and not plain:
         plain = "\n".join(line for _, line in synced)
-    return {"plain": plain, "synced": synced, "source": source}
+    words, ends = (None, None)
+    if synced and source == "file":
+        words, ends = _words_for(synced, words_raw)
+    return {"plain": plain, "synced": synced, "source": source, "words": words, "ends": ends}
 
 
 def read_lyrics(path):
     return read_lyrics_full(path)["plain"]
 
 
-def write_lyrics(path, text, synced=None):
+def write_lyrics(path, text, synced=None, words=None, ends=None):
     """Plain lyrics always; timed lines too when given. MP3 keeps both side by
-    side (USLT + SYLT); other formats store LRC text in their lyrics tag."""
+    side (USLT + SYLT); other formats store LRC text in their lyrics tag.
+    words/ends: per-line word timings, kept in their own AURA_WORDS tag so other
+    players still see ordinary line-by-line lyrics."""
     text = (text or "").replace("\r\n", "\n").strip()
     if synced and not text:
         text = "\n".join(line for _, line in synced)
     ext = Path(path).suffix.lower()
+    wtext = words_to_elrc(synced, words, ends) if (synced and words and any(words)) else ""
     if ext in (".wav", ".aif", ".aiff"):      # these carry an ID3 tag inside, same as MP3
         wf = MutagenFile(path)
         if wf is None:
@@ -1475,6 +1572,9 @@ def write_lyrics(path, text, synced=None):
         if synced:
             wf.tags.add(SYLT(encoding=3, lang="eng", format=2, type=1, desc="",
                              text=[(line, int(round(t * 1000))) for t, line in synced]))
+        wf.tags.delall("TXXX:" + WORDS_TAG)
+        if wtext:
+            wf.tags.add(TXXX(encoding=3, desc=WORDS_TAG, text=[wtext]))
         wf.save()
         return True
     if ext == ".mp3":
@@ -1489,6 +1589,9 @@ def write_lyrics(path, text, synced=None):
         if synced:
             tags.add(SYLT(encoding=3, lang="eng", format=2, type=1, desc="",
                           text=[(line, int(round(t * 1000))) for t, line in synced]))
+        tags.delall("TXXX:" + WORDS_TAG)
+        if wtext:
+            tags.add(TXXX(encoding=3, desc=WORDS_TAG, text=[wtext]))
         tags.save(path, v2_version=3)
         return True
     mf = MutagenFile(path)
@@ -1499,13 +1602,19 @@ def write_lyrics(path, text, synced=None):
             mf.add_tags()
         except Exception:
             return False
-    key = "\xa9lyr" if ext in (".m4a", ".mp4", ".aac") else "LYRICS"
+    is_mp4 = ext in (".m4a", ".mp4", ".aac")
+    key = "\xa9lyr" if is_mp4 else "LYRICS"
+    wkey = ("----:com.apple.iTunes:" + WORDS_TAG) if is_mp4 else WORDS_TAG
     value = to_lrc(synced) if synced else text
     try:
         if value:
             mf.tags[key] = [value]
         elif key in mf.tags:
             del mf.tags[key]
+        if wtext:
+            mf.tags[wkey] = [wtext.encode("utf-8")] if is_mp4 else [wtext]
+        elif wkey in mf.tags:
+            del mf.tags[wkey]
         mf.save()
         return True
     except Exception:
@@ -1776,7 +1885,10 @@ def get_whisper(name):
     if not model_ready(name):
         AS["downloading"] = name
     try:
-        m = WhisperModel(name, device="cpu", compute_type="int8", download_root=str(model_dir()))
+        cores = os.cpu_count() or 4
+        threads = max(2, min(12, cores // 2 if cores > 8 else cores))
+        m = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=threads,
+                         download_root=str(model_dir()))
     finally:
         AS["downloading"] = None
     AS["model"], AS["model_name"] = m, name
@@ -1789,16 +1901,24 @@ def _tok(text):
     return re.findall(r"[a-z0-9]+", t)
 
 
-def align_lyrics(lines, words):
-    """lines: lyric lines (str). words: [(word, start_seconds), ...] from speech
-    recognition. Returns ([(t, text, guessed)], confidence 0..1)."""
-    L = [(tk, i, k) for i, ln in enumerate(lines) for k, tk in enumerate(_tok(ln))]
-    W = [(tk, st) for w, st in words for tk in _tok(w)]
+def align_words(lines, words):
+    """lines: lyric lines (str). words: [(word, start, end), ...] from speech recognition.
+    Returns ([{"t", "text", "guessed", "words": [(t, word)], "end"}], confidence 0..1)."""
+    disp = [ln.split() for ln in lines]
+    L = []                                   # (token, line, token index in line, word index in line)
+    for i, dws in enumerate(disp):
+        k = 0
+        for wi, dw in enumerate(dws):
+            for tk in _tok(dw):
+                L.append((tk, i, k, wi))
+                k += 1
+    W = [(tk, st, en) for w, st, en in words for tk in _tok(w)]
     n, m = len(L), len(W)
+    blank = lambda ln, i: {"t": None, "text": ln, "guessed": True, "words": None, "end": None}
     if not lines:
         return [], 0.0
     if not n or not m:
-        return [(None, ln, True) for ln in lines], 0.0
+        return [blank(ln, i) for i, ln in enumerate(lines)], 0.0
     cache = {}
 
     def score(a, b):
@@ -1818,10 +1938,11 @@ def align_lyrics(lines, words):
         bi = bytearray(m + 1)
         bi[0] = 1
         a = L[i - 1][0]
+        last = i == n
         for j in range(1, m + 1):
             d = prev[j - 1] + score(a, W[j - 1][0])
             u = prev[j] + GAP
-            lft = cur[j - 1] + (GAP if i < n else 0.0)
+            lft = cur[j - 1] + (0.0 if last else GAP)
             if d >= u and d >= lft:
                 cur[j], bi[j] = d, 0
             elif u >= lft:
@@ -1830,7 +1951,6 @@ def align_lyrics(lines, words):
                 cur[j], bi[j] = lft, 2
         back.append(bi)
         prev = cur
-    # backtrack
     i, j = n, max(range(m + 1), key=lambda jj: prev[jj])
     match = {}
     while i > 0 and j > 0:
@@ -1844,20 +1964,23 @@ def align_lyrics(lines, words):
         else:
             j -= 1
     # a time for each line from its first matched word, adjusted for words before it
-    per_line = {}
-    counts = [0] * len(lines)
-    for li, (tk, line, k) in enumerate(L):
+    per_line, counts, matched_in = {}, [0] * len(lines), [0] * len(lines)
+    wtime = [dict() for _ in lines]          # line -> {word index: start}
+    last_end = [None] * len(lines)
+    for li, (tk, line, k, wi) in enumerate(L):
         counts[line] += 1
-        if li in match and line not in per_line:
-            per_line[line] = max(0.0, W[match[li]][1] - k * 0.28)
-    matched_in = [0] * len(lines)
-    for li in match:
-        matched_in[L[li][1]] += 1
+        if li in match:
+            st, en = W[match[li]][1], W[match[li]][2]
+            matched_in[line] += 1
+            if line not in per_line:
+                per_line[line] = max(0.0, st - k * 0.28)
+            wtime[line].setdefault(wi, st)
+            last_end[line] = en
     times = [per_line.get(i) for i in range(len(lines))]
     anchors = [i for i, t in enumerate(times) if t is not None]
     guessed = [times[i] is None or (counts[i] and matched_in[i] / counts[i] < 0.3) for i in range(len(lines))]
     if not anchors:
-        return [(None, ln, True) for ln in lines], 0.0
+        return [blank(ln, i) for i, ln in enumerate(lines)], 0.0
     first, last = anchors[0], anchors[-1]
     for i in range(first - 1, -1, -1):
         times[i] = max(0.0, times[i + 1] - 2.5)
@@ -1875,35 +1998,204 @@ def align_lyrics(lines, words):
     for i in range(1, len(times)):          # never go backwards
         if times[i] < times[i - 1] + 0.2:
             times[i] = times[i - 1] + 0.2
-    conf = len(match) / float(n)
-    return [(round(t, 2), ln, bool(g)) for t, ln, g in zip(times, lines, guessed)], round(conf, 3)
+    out = []
+    for i, ln in enumerate(lines):
+        nxt = times[i + 1] if i + 1 < len(lines) else None
+        end = last_end[i] if last_end[i] is not None and last_end[i] > times[i] else None
+        ws, end = spread_words(disp[i], wtime[i], times[i], nxt, end)
+        out.append({"t": round(times[i], 2), "text": ln, "guessed": bool(guessed[i]), "words": ws, "end": end})
+    return out, round(len(match) / float(n), 3)
 
 
-def words_to_lines(words, max_words=9, gap=0.7):
-    """Turn transcribed words into lyric lines by pauses and length."""
-    out, cur, start, last_end = [], [], None, None
+def spread_words(dws, known, start, nxt, end=None):
+    """Times for every word of a line. known: {word index: time} for the words that were
+    heard; the rest are placed between their neighbours by length."""
+    if not dws:
+        return None, None
+    limit = (nxt - 0.05) if nxt is not None else None
+    if end is None:
+        last_known = max(known.values()) if known else start
+        end = max(last_known + 0.4, start + 0.32 * len(dws))
+    if limit is not None:
+        end = min(end, limit)
+    end = max(end, start + 0.1)
+    pts = {0: start}
+    for wi, t in known.items():
+        if 0 < wi < len(dws) and start < t < end:
+            pts[wi] = t
+    pts[len(dws)] = end
+    keys = sorted(pts)
+    # drop anything out of order
+    clean, lastt = [], -1.0
+    for k in keys:
+        if pts[k] > lastt or k == 0:
+            clean.append(k)
+            lastt = pts[k]
+    if clean[-1] != len(dws):
+        clean.append(len(dws))
+        pts[len(dws)] = max(end, lastt + 0.1)
+    ts = [0.0] * len(dws)
+    for a, b in zip(clean, clean[1:]):
+        w = [max(1, len(x)) for x in dws[a:b]]
+        tot, acc = float(sum(w)), 0.0
+        for k in range(a, b):
+            ts[k] = pts[a] + (pts[b] - pts[a]) * acc / tot
+            acc += w[k - a]
+    return [(round(t, 2), w) for t, w in zip(ts, dws)], round(pts[len(dws)], 2)
+
+
+def align_lyrics(lines, words):
+    """Line times only (older callers). words: [(word, start), ...]."""
+    out, conf = align_words(lines, [(w, st, st + 0.25) for w, st in words])
+    return [(o["t"], o["text"], o["guessed"]) for o in out], conf
+
+
+def refine_forced(model, audio, out, language, should_stop=lambda: False, on_progress=None):
+    """Second, precise pass. The first pass only tells us roughly where each line is and
+    can mishear words; here the real lyric words are laid over the audio one window at a
+    time (forced alignment), which times every word, including the misheard ones.
+    Changes `out` in place. Returns (windows accepted, windows tried)."""
+    from faster_whisper.tokenizer import Tokenizer
+    from faster_whisper.audio import pad_or_trim
+    sr = 16000
+    tok = Tokenizer(model.hf_tokenizer, model.model.is_multilingual, task="transcribe",
+                    language=(language or "en"))
+    total = len(audio) / float(sr)
+    idx = [i for i, o in enumerate(out) if o["t"] is not None and o["text"].split()]
+    accepted = tried = 0
+    pos = 0
+    while pos < len(idx):
+        if should_stop():
+            break
+        first = idx[pos]
+        ws = max(0.0, out[first]["t"] - 0.8)
+        group, ntok, toks = [], 0, []
+        while pos < len(idx):
+            i = idx[pos]
+            if group and (out[i]["t"] - ws > 22.0 or ntok > 190):
+                break
+            ids = tok.encode(" " + " ".join(out[i]["text"].split()))
+            ids = [t for t in ids if t < tok.eot]
+            if group and ntok + len(ids) > 220:
+                break
+            group.append(i)
+            toks.append(ids)
+            ntok += len(ids)
+            pos += 1
+        nxt_i = idx[pos] if pos < len(idx) else None
+        we = min(total, ws + 30.0, (out[nxt_i]["t"] + 0.6) if nxt_i is not None else total)
+        if we - ws < 0.5 or not ntok:
+            continue
+        tried += 1
+        chunk = audio[int(ws * sr):int(we * sr)]
+        feats = model.feature_extractor(chunk)
+        frames = min(feats.shape[-1], 3000)
+        enc = model.encode(pad_or_trim(feats))
+        flat = [t for ids in toks for t in ids]
+        res = model.find_alignment(tok, [flat], enc, frames)
+        res = res[0] if res and isinstance(res[0], list) else res
+        if on_progress:
+            on_progress(min(1.0, we / total) if total else 1.0)
+        if not res:
+            continue
+        # fold the model's word pieces back onto our own words, by letters
+        pieces = [(str(r["word"]), float(r["start"]) + ws, float(r["end"]) + ws, float(r.get("probability", 0))) for r in res]
+        strip = lambda x: re.sub(r"\s+", "", x)
+        pi, new, ok = 0, {}, True
+        for i in group:
+            lw = []
+            for dw in out[i]["text"].split():
+                need, got, st, en, pr = len(strip(dw)), 0, None, None, []
+                while pi < len(pieces) and got < need:
+                    w_, s_, e_, p_ = pieces[pi]
+                    got += len(strip(w_))
+                    st = s_ if st is None else st
+                    en = e_
+                    pr.append(p_)
+                    pi += 1
+                if st is None:
+                    ok = False
+                    break
+                lw.append((st, en, dw, sum(pr) / len(pr) if pr else 0.0))
+            if not ok:
+                break
+            new[i] = lw
+        if not ok or not new:
+            continue
+        # Trust check: where the first pass clearly heard a line, both passes must agree.
+        diffs = [abs(new[i][0][0] - out[i]["t"]) for i in group if i in new and not out[i]["guessed"]]
+        if diffs and sorted(diffs)[len(diffs) // 2] > 1.5:
+            continue
+        accepted += 1
+        for i in group:
+            lw = new.get(i)
+            if not lw:
+                continue
+            nxt = out[i + 1]["t"] if i + 1 < len(out) and out[i + 1]["t"] is not None else None
+            if out[i]["guessed"] and (sum(x[3] for x in lw) / len(lw)) < 0.2:
+                continue                      # still unsure: keep the estimate and the flag
+            ts, lastt = [], -1.0
+            for st, en, dw, pr in lw:
+                st = max(st, lastt + 0.02)
+                ts.append((round(st, 2), dw))
+                lastt = st
+            end = max(lw[-1][1], ts[-1][0] + 0.1)
+            if nxt is not None and i + 1 in new:
+                end = min(end, new[i + 1][0][0])
+            out[i]["t"] = ts[0][0]
+            out[i]["words"] = ts
+            out[i]["end"] = round(end, 2)
+            if out[i]["guessed"] and (sum(x[3] for x in lw) / len(lw)) >= 0.35:
+                out[i]["guessed"] = False
+    # keep everything in order after the per-window changes
+    lastt = -1.0
+    for o in out:
+        if o["t"] is None:
+            continue
+        if o["t"] <= lastt:
+            shift = lastt + 0.05 - o["t"]
+            o["t"] = round(o["t"] + shift, 2)
+            if o["words"]:
+                o["words"] = [(round(t + shift, 2), w) for t, w in o["words"]]
+        lastt = o["t"]
+    return accepted, tried
+
+
+def words_to_lines(words, max_words=10, gap=0.6):
+    """Turn transcribed words into lyric lines by pauses, punctuation and length.
+    -> [(t, text, [(t, word)], end)]"""
+    out, cur = [], []
+
+    def flush():
+        if cur:
+            txt = re.sub(r"\s+([,.?!])", r"\1", " ".join(w for w, _, _ in cur)).strip()
+            if txt:
+                txt = txt[0].upper() + txt[1:]
+                ws = [(round(st, 2), w) for w, st, _ in cur]
+                ws[0] = (ws[0][0], txt.split()[0]) if txt.split() else ws[0]
+                out.append((round(cur[0][1], 2), txt, ws if len(ws) == len(txt.split()) else None, round(cur[-1][2], 2)))
+        cur.clear()
+
+    last_end = None
     for w, st, en in words:
         w = w.strip()
         if not w:
             continue
-        if cur and ((st - (last_end or st)) > gap or len(cur) >= max_words):
-            out.append((round(start, 2), " ".join(cur)))
-            cur, start = [], None
-        if start is None:
-            start = st
-        cur.append(w)
+        pause = (st - last_end) if last_end is not None else 0.0
+        if cur and (pause > gap or len(cur) >= max_words or
+                    (len(cur) >= 5 and pause > 0.3) or (len(cur) >= 6 and cur[-1][0][-1:] == ",")):
+            flush()
+        cur.append((w, st, en))
         last_end = en
-        if w[-1:] in ".?!":
-            out.append((round(start, 2), " ".join(cur)))
-            cur, start = [], None
-    if cur:
-        out.append((round(start, 2), " ".join(cur)))
-    return [(t, re.sub(r"\s+([,.?!])", r"\1", txt).strip()) for t, txt in out]
+        if w[-1:] in ".?!" and len(cur) >= 3:
+            flush()
+    flush()
+    return out
 
 
 def _job_public(j):
     return {k: j.get(k) for k in ("id", "track_id", "title", "state", "progress", "mode", "confidence",
-                                  "error", "saved", "autosave", "result")}
+                                  "error", "saved", "autosave", "result", "note")}
 
 
 def autosync_enqueue(tid, autosave=False):
@@ -1934,6 +2226,7 @@ def _run_autosync(j):
     row = _track_row(j["track_id"])
     if not row or not os.path.exists(row["path"]):
         raise OSError("the file is missing")
+    cfg = load_config()
     lf = read_lyrics_full(row["path"])
     lyrics = lf["plain"]
     lines = [ln.strip() for ln in lyrics.split("\n") if ln.strip()]
@@ -1941,35 +2234,69 @@ def _run_autosync(j):
     audio = decode_mono(row["path"], target_sr=16000, max_seconds=900)
     if audio is None or not len(audio):
         raise OSError("couldn't decode the audio")
+    audio = np.asarray(audio, dtype=np.float32)
     dur = len(audio) / 16000.0
     j["state"] = "loading"
-    model = get_whisper(load_config().get("autosync_model") or "small")
+    model = get_whisper(cfg.get("autosync_model") or "small")
     j["state"] = "running"
-    prompt = " ".join(" ".join(lines).split())[:220] if lines else None
-    segments, info = model.transcribe(np.asarray(audio, dtype=np.float32), word_timestamps=True,
-                                      vad_filter=False, condition_on_previous_text=False,
-                                      initial_prompt=prompt, beam_size=5)
+    lang = (cfg.get("autosync_language") or "").strip().lower() or None
+    precise = bool(cfg.get("autosync_precise", True)) and j["mode"] == "align"
+    share = 0.7 if precise else 1.0           # how much of the progress bar the first pass gets
+    opts = dict(word_timestamps=True, vad_filter=False, condition_on_previous_text=False, language=lang)
+    if j["mode"] == "align":
+        # The words are already known, so this pass only has to find where they are:
+        # the quickest decoding is enough.
+        opts.update(beam_size=1, best_of=1, temperature=0.0,
+                    initial_prompt=" ".join(" ".join(lines).split())[:220])
+    else:
+        hint = "Lyrics of the song %s%s:" % (clean_song_title(row["title"] or Path(row["filename"]).stem),
+                                           (" by " + row["artist"].split(",")[0]) if row["artist"] else "")
+        opts.update(beam_size=5, initial_prompt=hint, hallucination_silence_threshold=2.0)
+    try:
+        segments, info = model.transcribe(audio, **opts)
+    except TypeError:                         # an older engine without one of the options
+        for k in ("hallucination_silence_threshold", "best_of"):
+            opts.pop(k, None)
+        segments, info = model.transcribe(audio, **opts)
     words = []
     for seg in segments:
         if j["cancel"]:
             raise _Cancelled()
-        j["progress"] = round(min(0.99, (seg.end or 0) / dur), 3) if dur else 0.0
+        j["progress"] = round(min(0.99, (seg.end or 0) / dur) * share, 3) if dur else 0.0
         for w in (seg.words or []):
             words.append((w.word, float(w.start), float(w.end)))
     if j["mode"] == "align":
-        synced, conf = align_lyrics(lines, [(w, st) for w, st, en in words])
+        out, conf = align_words(lines, words)
         j["confidence"] = conf
-        j["result"] = {"lyrics": lyrics, "lines": [{"t": t, "text": tx, "guessed": g} for t, tx, g in synced]}
-        if j["autosave"] and conf >= 0.6 and all(t is not None for t, _, _ in synced):
-            write_lyrics(row["path"], lyrics, [(t, tx) for t, tx, _ in synced])
+        j["note"] = ""
+        if precise and any(o["t"] is not None for o in out):
+            try:
+                okw, tried = refine_forced(
+                    model, audio, out, lang or getattr(info, "language", None) or "en",
+                    should_stop=lambda: j["cancel"],
+                    on_progress=lambda f: j.__setitem__("progress", round(share + (1 - share) * min(0.99, f), 3)))
+                j["note"] = "precise pass: %d of %d parts" % (okw, tried)
+            except Exception as exc:
+                j["note"] = "precise pass skipped (%s)" % (str(exc) or type(exc).__name__)[:120]
+            if j["cancel"]:
+                raise _Cancelled()
+        j["result"] = {"lyrics": lyrics, "note": j["note"],
+                       "lines": [{"t": o["t"], "text": o["text"], "guessed": o["guessed"],
+                                  "words": [{"t": t, "w": w} for t, w in o["words"]] if o["words"] else None,
+                                  "end": o["end"]} for o in out]}
+        if j["autosave"] and conf >= 0.6 and all(o["t"] is not None for o in out):
+            write_lyrics(row["path"], lyrics, [(o["t"], o["text"]) for o in out],
+                         [o["words"] for o in out], [o["end"] for o in out])
             _reindex_lyrics(row["id"], row["path"])
             j["saved"] = True
     else:
         lns = words_to_lines(words)
-        j["result"] = {"lyrics": "\n".join(tx for _, tx in lns),
-                       "lines": [{"t": t, "text": tx, "guessed": False} for t, tx in lns]}
         if not lns:
             raise OSError("no singing was recognised")
+        j["result"] = {"lyrics": "\n".join(tx for _, tx, _, _ in lns), "note": "",
+                       "lines": [{"t": t, "text": tx, "guessed": False,
+                                  "words": [{"t": wt, "w": w} for wt, w in ws] if ws else None, "end": en}
+                                 for t, tx, ws, en in lns]}
     j["progress"] = 1.0
 
 
@@ -2607,7 +2934,8 @@ def _copy_metadata(row, src, dest):
         set_artwork(dest, art, mime)
     lf = read_lyrics_full(src)
     if lf["plain"] or lf["synced"]:
-        write_lyrics(dest, lf["plain"] or "\n".join(t for _, t in lf["synced"]), lf["synced"] or None)
+        write_lyrics(dest, lf["plain"] or "\n".join(t for _, t in lf["synced"]), lf["synced"] or None,
+                     lf.get("words"), lf.get("ends"))
 
 
 def convert_one(job, kbps, originals):
@@ -2871,7 +3199,7 @@ def _set_config(body):
     for key in ("folders", "quarantine", "rename_pattern",
                 "write_tags_to_file", "fingerprint", "watch_folders",
                 "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
-                "autosync_model", "detect_bpm_key"):
+                "autosync_model", "detect_bpm_key", "autosync_language", "autosync_precise"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -3634,8 +3962,18 @@ def api_lyrics_get(tid):
     if not row or not os.path.exists(row["path"]):
         return jsonify({"error": "missing"}), 404
     lf = read_lyrics_full(row["path"])
+    timed = None
+    if lf["synced"]:
+        timed = []
+        for i, (t, line) in enumerate(lf["synced"]):
+            item = {"t": t, "text": line}
+            if lf["words"] and lf["words"][i]:
+                item["words"] = [{"t": wt, "w": w} for wt, w in lf["words"][i]]
+                if lf["ends"][i] is not None:
+                    item["end"] = lf["ends"][i]
+            timed.append(item)
     return jsonify({"lyrics": lf["plain"],
-                    "synced": [{"t": t, "text": line} for t, line in lf["synced"]] if lf["synced"] else None,
+                    "synced": timed, "by_word": bool(lf["words"]),
                     "source": lf["source"],
                     "editable": (row["ext"] or "").lower() in ("mp3", "m4a", "mp4", "aac", "flac", "ogg", "opus", "wav", "aif", "aiff")})
 
@@ -3648,10 +3986,20 @@ def api_lyrics_set(tid):
     if len(text) > 200_000:
         return jsonify({"error": "Lyrics are too long"}), 400
     lines = None
+    words = ends = None
     if synced:
         try:
-            lines = sorted(((max(0.0, float(x["t"])), str(x.get("text", ""))[:500]) for x in synced),
-                           key=lambda x: x[0])
+            order = sorted(synced, key=lambda x: float(x["t"]))
+            lines = [(max(0.0, float(x["t"])), str(x.get("text", ""))[:500]) for x in order]
+            words, ends = [], []
+            for x in order:
+                ws = x.get("words")
+                if ws:
+                    ws = [(max(0.0, float(w["t"])), str(w["w"])[:80]) for w in ws if str(w.get("w", "")).strip()]
+                words.append(ws or None)
+                ends.append(float(x["end"]) if x.get("end") is not None and ws else None)
+            if not any(words):
+                words = ends = None
         except (TypeError, ValueError, KeyError):
             return jsonify({"error": "Bad timed lyrics"}), 400
         if len(lines) > 2000:
@@ -3660,7 +4008,7 @@ def api_lyrics_set(tid):
     if not row or not os.path.exists(row["path"]):
         return jsonify({"error": "That file is missing"}), 404
     try:
-        ok = write_lyrics(row["path"], text, lines)
+        ok = write_lyrics(row["path"], text, lines, words, ends)
     except Exception as exc:
         return jsonify({"error": "Couldn't save lyrics: %s" % exc}), 500
     if not ok:
@@ -3733,6 +4081,7 @@ def api_autosync_status():
     with AS["lock"]:
         jobs = [_job_public(j) for j in AS["jobs"][-60:]]
     return jsonify({"available": ok, "reason": reason, "model": name,
+                    "language": cfg.get("autosync_language", "en"), "precise": bool(cfg.get("autosync_precise", True)),
                     "ready": {k: model_ready(k) for k in AUTOSYNC_MODELS},
                     "sizes": AUTOSYNC_MODELS, "downloading": dl, "jobs": jobs})
 

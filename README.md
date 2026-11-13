@@ -31,6 +31,14 @@ report to `%APPDATA%\Unreleased\selftest.txt`.
 
 ## Listen
 
+**Home** is where AURA opens: quick picks you can start with one click
+(Favorites, Top rated, your biggest playlists and eras), then shelves —
+**Jump back in** (what you played last), **Recently added**, **On repeat**
+(most played), **Rediscover** (songs you loved and haven't played in three
+weeks), **Never played**, **Eras** and **Your artists**. Click a cover to play
+it with the rest of its shelf queued; right-click for the usual song menu.
+**Songs** is still the full A–Z list.
+
 The switch at the top flips between **Listen** and **Organize**. Both sides
 share one player bar at the bottom.
 
@@ -76,8 +84,12 @@ itself, like Apple Music. Click any line to jump there. Scroll to read ahead —
 it waits a few seconds before following the song again. Timings come from:
 - **Auto-sync** — AURA listens to the song with a speech model that runs on
   your PC (Whisper, nothing is uploaded) and times each line of the lyrics you
-  already have. Works on unreleased songs and your own tracks. When it's done
-  you get a review window: lines it couldn't hear clearly are marked **check**
+  already have — **word by word**: in Now Playing and in full-screen lyrics
+  each word lights up as it's sung (a WORD BY WORD badge shows when a song has
+  this). Works on unreleased songs and your own tracks. It runs in two passes:
+  a quick listen to find where each line is, then a precise pass that lays your
+  actual lyric words over the audio, so words the model misheard still get
+  their own time. When it's done you get a review window: lines it couldn't hear clearly are marked **check**
   and their times are a guess — click a time and re-tap, or nudge with `−`/`+`.
 - **Transcribe** — for a song with no lyrics anywhere, AURA writes the words
   down itself, already timed. Expect to fix some words, especially on
@@ -102,6 +114,15 @@ next to the plain lyrics; other formats: LRC text in the lyrics tag).
 but no timings** works through your whole library in the background: songs it's
 confident about are saved straight away, the rest are listed with a **Check**
 link. With **Better**, expect around a minute per song on a typical PC.
+- **Songs are in** — the language of your songs (English by default). Fixing
+  it is quicker and more reliable than letting the model guess each time.
+- **Precise word timing** — the second pass. Turn it off for the fastest sync;
+  you still get word-by-word lyrics, with misheard words placed between their
+  neighbours.
+Word timings are kept in the song file in their own `AURA_WORDS` tag, next to
+the normal line-by-line lyrics, so other players and your phone still see
+ordinary synced lyrics. Moving a line in the sync window moves its words with
+it; changing a line's text drops the word timings for that line only.
 
 **Full-screen lyrics.** **Full screen** in the lyrics bar (or `K`) shows the
 lyrics karaoke-style: the current line huge, the next lines coming up, the
