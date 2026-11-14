@@ -414,22 +414,58 @@ input[type=range]{accent-color:var(--accent);height:4px}
   color:var(--accent-soft);cursor:pointer;margin-right:4px;display:none}
 .abchip.on{display:inline-block}
 #npAB.on{background:var(--accent-dim);color:var(--accent-soft)}
-/* karaoke */
-.kara{position:fixed;inset:0;z-index:150;background:#000;display:flex;flex-direction:column;overflow:hidden}
-.kara .kbg{position:absolute;inset:-60px;background-size:cover;background-position:center;filter:blur(60px) brightness(.38) saturate(1.3);transform:scale(1.1)}
-.kara .ktop{position:relative;display:flex;align-items:center;gap:14px;padding:22px 30px}
-.kara .ktop img,.kara .ktop .kph{width:54px;height:54px;border-radius:10px;object-fit:cover;background:#ffffff14}
-.kara .ktt{font-weight:800;font-size:17px;color:#fff}.kara .kta{font-size:13.5px;color:#ffffffaa}
-.kara .klines{position:relative;flex:1;display:flex;flex-direction:column;justify-content:center;padding:0 7vw;gap:2.2vh;overflow:hidden}
-.kara .kl{font-weight:800;color:#ffffff40;font-size:clamp(22px,3.4vw,46px);line-height:1.25;transition:color .25s,transform .25s,font-size .25s;transform-origin:left center}
-.kara .kl.cur{color:#fff;font-size:clamp(30px,5.2vw,74px)}
-.kara .kl.past{color:#ffffff26;font-size:clamp(18px,2.4vw,32px)}
-.kara .kplain{position:relative;flex:1;overflow:hidden;padding:0 7vw;mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent)}
-.kara .kplain div{font-weight:800;color:#fff;font-size:clamp(24px,3.6vw,48px);line-height:1.45;white-space:pre-wrap;padding:40vh 0}
-.kara .kbot{position:relative;display:flex;align-items:center;gap:14px;padding:18px 30px 26px}
-.kara .kprog{flex:1;height:4px;border-radius:4px;background:#ffffff26;overflow:hidden}.kara .kprog i{display:block;height:100%;background:#fff;width:0}
+/* full-screen lyrics: space */
+.kara{position:fixed;inset:0;z-index:150;background:radial-gradient(120% 90% at 50% 110%,#0b1030 0%,#05060f 55%,#020208 100%);
+  display:flex;flex-direction:column;overflow:hidden;color:#fff;--k1:#6a5cff;--k2:#1688ff;--kp:0}
+.kara canvas.kstars{position:absolute;inset:0;width:100%;height:100%}
+.kara .kneb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.56;mix-blend-mode:screen;pointer-events:none;will-change:transform}
+.kara .kneb.n1{width:58vw;height:58vw;left:-16vw;top:-18vw;background:radial-gradient(circle,var(--k1),transparent 65%);animation:kdrift1 46s ease-in-out infinite alternate}
+.kara .kneb.n2{width:52vw;height:52vw;right:-14vw;bottom:-20vw;background:radial-gradient(circle,var(--k2),transparent 65%);animation:kdrift2 58s ease-in-out infinite alternate}
+.kara .kneb.n3{width:34vw;height:34vw;left:34vw;top:30vh;background:radial-gradient(circle,var(--k1),transparent 70%);opacity:.16;animation:kdrift2 70s ease-in-out infinite alternate-reverse}
+@keyframes kdrift1{to{transform:translate(9vw,7vh) scale(1.15)}}
+@keyframes kdrift2{to{transform:translate(-8vw,-6vh) scale(1.2)}}
+.kara .kvig{position:absolute;inset:0;background:radial-gradient(ellipse at center,transparent 45%,#000000b8 100%);pointer-events:none}
+.kara .ktopbar{position:relative;display:flex;align-items:center;gap:12px;padding:18px 26px 0;z-index:2}
+.kara .khint{font-size:12px;color:#ffffff73;margin-left:auto}
 .kara .ib{color:#fff}
-.kara .khint{font-size:12px;color:#ffffff80}
+.kara .kwrap{position:relative;flex:1;display:flex;align-items:center;gap:5vw;padding:0 6vw;min-height:0;z-index:1}
+.kara .kleft{width:min(34vw,46vh);flex:none;display:flex;flex-direction:column;align-items:center;text-align:center}
+.kara .korbit{position:relative;width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center}
+.kara .kring{position:absolute;inset:0;border-radius:50%;border:1px solid #ffffff2b;transform:rotateX(72deg) rotateZ(0deg);animation:kspin 26s linear infinite}
+.kara .kring.r2{inset:-9%;border-color:#ffffff1a;animation-duration:44s;animation-direction:reverse;transform:rotateX(72deg) rotateY(14deg)}
+.kara .kring i{position:absolute;top:-4px;left:50%;width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 14px 3px var(--k1)}
+@keyframes kspin{to{transform:rotateX(72deg) rotateZ(360deg)}}
+.kara .kart{width:68%;aspect-ratio:1;border-radius:22px;overflow:hidden;position:relative;background:#ffffff12;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 calc(50px + 70px*var(--kp)) calc(2px + 12px*var(--kp)) color-mix(in srgb,var(--k1) 70%,transparent),0 30px 80px #000c;
+  transform:scale(calc(1 + .035*var(--kp)));animation:kfloat 9s ease-in-out infinite alternate}
+.kara .kart img{width:100%;height:100%;object-fit:cover;display:block}
+.kara .kart svg{width:34%;height:34%;color:#ffffff66}
+@keyframes kfloat{from{translate:0 -6px}to{translate:0 8px}}
+.kara .ktt{font-weight:800;font-size:clamp(20px,2.3vw,34px);letter-spacing:-.02em;margin-top:3.2vh;line-height:1.15;text-shadow:0 2px 24px #000a}
+.kara .kta{font-size:clamp(14px,1.25vw,19px);color:#ffffffc7;margin-top:8px;font-weight:600}
+.kara .kmeta{font-size:12.5px;color:#ffffff80;margin-top:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}
+.kara .kright{flex:1;min-width:0;height:100%;position:relative;overflow:hidden;
+  -webkit-mask-image:linear-gradient(transparent,#000 22%,#000 78%,transparent);mask-image:linear-gradient(transparent,#000 22%,#000 78%,transparent)}
+.kara .kcol{position:absolute;left:0;right:0;top:0;transition:transform .7s cubic-bezier(.22,.8,.24,1);will-change:transform;padding:0 4vw 0 34px}
+.kara .kl{font-weight:800;font-size:clamp(24px,3.5vw,54px);line-height:1.22;letter-spacing:-.02em;color:#fff;opacity:.2;margin:0 0 3.4vh;cursor:pointer;
+  transform-origin:left center;transform:scale(.86);transition:opacity .6s,transform .7s cubic-bezier(.22,.8,.24,1),filter .6s;filter:blur(1.2px)}
+.kara .kl.near{opacity:.42;filter:blur(.4px)}
+.kara .kl.cur{opacity:1;transform:scale(1);filter:none;text-shadow:0 0 34px color-mix(in srgb,var(--k1) 55%,transparent)}
+.kara .kl.cur.byw{text-shadow:none;filter:drop-shadow(0 0 16px color-mix(in srgb,var(--k1) 60%,transparent))}
+.kara .kplain{flex:1;height:100%;overflow:hidden;-webkit-mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent);mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent)}
+.kara .kplain div{font-weight:800;color:#fff;font-size:clamp(22px,2.9vw,44px);line-height:1.45;white-space:pre-wrap;padding:42vh 3vw 42vh 0}
+.kara .kbot{position:relative;display:flex;align-items:center;gap:14px;padding:14px 30px 24px;z-index:2;opacity:.9}
+.kara .kbot .tm{color:#ffffffb3}
+.kara .kprog{flex:1;height:4px;border-radius:4px;background:#ffffff24;overflow:hidden;cursor:pointer}
+.kara .kprog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--k2),#fff);box-shadow:0 0 12px var(--k1)}
+.kara.idle .ktopbar,.kara.idle .kbot{opacity:0;transition:opacity .8s}.kara .ktopbar,.kara .kbot{transition:opacity .25s}
+.kara.idle{cursor:none}
+@media (max-width:900px){.kara .kleft{display:none}}
+@media (prefers-reduced-motion:reduce){.kara .kneb,.kara .kring,.kara .kart{animation:none}}
+/* editing a line in the sync window */
+.sline .tx{cursor:text}.sline .tx input{width:100%;background:var(--hover);border:1px solid var(--accent);border-radius:6px;color:var(--text);font:inherit;padding:2px 6px;outline:none}
+.foundbar{margin:0 18px 8px;padding:10px 12px;border-radius:12px;background:var(--accent-dim);border:1px solid #087cfa55;font-size:13px;display:flex;gap:10px;align-items:center}
+.foundbar span{flex:1}
 /* history */
 .htime{font-size:11.5px;color:var(--faint);margin-left:auto;padding-right:8px;white-space:nowrap}
 .qtabs{display:flex;gap:4px;margin-right:auto}.qtabs button{background:none;border:0;color:var(--faint);font-weight:800;font-size:15px;cursor:pointer;padding:2px 6px;border-radius:8px;font-family:inherit}
@@ -459,16 +495,13 @@ input[type=range]{accent-color:var(--accent);height:4px}
 .prop .fc{font-size:11.5px;border-radius:8px;padding:2px 8px;background:var(--accent-dim);color:var(--text);cursor:pointer;user-select:none}
 .prop .fc.off{background:var(--hair);color:var(--faint);text-decoration:line-through}
 .prop .fc i{font-style:normal;color:var(--faint);margin-right:4px}
-/* word-by-word lyrics */
-.lyr.synced .ln .w{transition:color .12s}
+/* word-by-word lyrics: one soft wipe that glides across the line */
 .lyr.synced .ln.on.byw{color:var(--faint)}
-.lyr.synced .ln.on.byw .w{color:color-mix(in srgb,var(--text) 38%,transparent)}
-.lyr.synced .ln.on.byw .w.sung{color:var(--text)}
-.lyr.synced .ln.on.byw .w.now{background:linear-gradient(90deg,var(--text) var(--p,0%),color-mix(in srgb,var(--text) 38%,transparent) var(--p,0%));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-.kara .kl.cur.byw{color:#ffffff59}
-.kara .kl.cur.byw .w.sung{color:#fff}
-.kara .kl.cur.byw .w.now{background:linear-gradient(90deg,#fff var(--p,0%),#ffffff59 var(--p,0%));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lyr.synced .ln.on.byw .w,.kara .kl.cur.byw .w{
+  background-image:linear-gradient(90deg,var(--wc1) calc(var(--p,-10%) - 9%),var(--wc0) calc(var(--p,-10%) + 9%));
+  -webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent}
+.lyr.synced .ln.on.byw{--wc1:var(--text);--wc0:color-mix(in srgb,var(--text) 34%,transparent)}
+.kara .kl.cur.byw{--wc1:#fff;--wc0:#ffffff4d}
 .bywchip{font-size:9.5px;font-weight:800;letter-spacing:.07em;border-radius:20px;padding:1px 7px;background:var(--accent-dim);color:var(--accent-soft);
   align-self:center;white-space:nowrap}
 /* home */
@@ -995,6 +1028,13 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <option value="base">Fast — 145 MB download</option>
             <option value="small">Better — 480 MB (recommended)</option>
             <option value="large-v3-turbo">Best — 1.6 GB, slower</option></select></div>
+          <div class="srow2"><span>Transcribe with</span><select class="search" id="cfgTrModel" style="max-width:300px">
+            <option value="large-v3-turbo">Best — 1.6 GB, slowest, fewest wrong words</option>
+            <option value="small">Better — 480 MB</option>
+            <option value="base">Fast — 145 MB</option>
+            <option value="same">Same as auto-sync</option></select></div>
+          <label class="chk2"><input type="checkbox" id="cfgTrLook"><span>After transcribing, look online for real lyrics that match what was heard
+            <span style="color:var(--faint)">(LRCLIB and Genius — fixes misheard words when the song's lyrics exist anywhere)</span></span></label>
           <div class="srow2"><span>Songs are in</span><select class="search" id="cfgAsLang" style="max-width:300px">
             <option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option>
             <option value="pt">Portuguese</option><option value="it">Italian</option><option value="ja">Japanese</option><option value="ko">Korean</option>
@@ -2145,9 +2185,10 @@ function ensureGraph(){
     const lim=ACTX.createDynamicsCompressor();     // keeps boosted songs from clipping
     lim.threshold.value=-1.5;lim.knee.value=0;lim.ratio.value=20;lim.attack.value=0.003;lim.release.value=0.2;
     filters[filters.length-1].connect(lim);lim.connect(ACTX.destination);
+    let an=null;try{an=ACTX.createAnalyser();an.fftSize=256;an.smoothingTimeConstant=0.78;lim.connect(an);}catch(e){an=null;}
     const gains=new Map();
     DECKS.forEach(d=>{const src=ACTX.createMediaElementSource(d),g=ACTX.createGain();src.connect(g);g.connect(filters[0]);gains.set(d,g);});
-    GRAPH={filters,gains,lim};
+    GRAPH={filters,gains,lim,an};
     applyEq();applyVol();
   }catch(e){ACTX=false;GRAPH=null;}
   return GRAPH;
@@ -2585,32 +2626,47 @@ async function showLyrics(body,t){
 }
 $('#npBody').addEventListener('wheel',()=>{LYRUSER=Date.now();},{passive:true});
 const wordSpans=ws=>ws.map(w=>'<span class="w">'+esc(w.w)+'</span>').join(' ');
-/* light up the words of the current line as they are sung */
+/* A steady clock for the word wipe: the player only reports its position every few
+   milliseconds, so between reports we carry on from the last one. */
+const SMOOTH={a:0,p:0,v:0};
+function smoothTime(){
+  const a=audio.currentTime,now=performance.now();
+  if(audio.paused||audio.seeking){SMOOTH.a=a;SMOOTH.p=now;SMOOTH.v=a;return a;}
+  if(a!==SMOOTH.a){SMOOTH.a=a;SMOOTH.p=now;}
+  let v=SMOOTH.a+(now-SMOOTH.p)/1000*(audio.playbackRate||1);
+  if(Math.abs(v-a)>0.25)v=a;                      // a seek or a stall: snap
+  if(v<SMOOTH.v&&SMOOTH.v-v<0.08)v=SMOOTH.v;      // never step back a hair
+  SMOOTH.v=v;return v;
+}
+/* light up the words of the current line as they are sung: one continuous wipe */
 function paintWords(line,cur,nextT){
   if(!line||!line.words)return;
   const W=line.words,S=line.ws;let k=-1;
-  for(let i=0;i<W.length;i++){if(W[i].t<=cur+0.02)k=i;else break;}
+  for(let i=0;i<W.length;i++){if(W[i].t<=cur)k=i;else break;}
   for(let i=0;i<S.length;i++){
-    const on=i<k,now=i===k;
-    if(S[i]._s!==(now?2:on?1:0)){S[i]._s=now?2:on?1:0;S[i].classList.toggle('sung',on);S[i].classList.toggle('now',now);if(!now)S[i].style.removeProperty('--p');}
-  }
-  if(k>=0){
-    const a=W[k].t,b=k+1<W.length?W[k+1].t:(line.end!=null?line.end:(nextT!=null?Math.min(nextT,a+1.2):a+0.6));
-    const pct=Math.max(0,Math.min(100,100*(cur-a)/Math.max(0.08,b-a)));
-    S[k].style.setProperty('--p',pct.toFixed(1)+'%');
+    let p;
+    if(i<k)p=110;else if(i>k)p=-10;
+    else{
+      const a=W[k].t;let b=k+1<W.length?W[k+1].t:(line.end!=null?line.end:(nextT!=null?Math.min(nextT,a+1.2):a+0.6));
+      b=Math.min(b,a+1.6);                        // a held note: finish the word, don't crawl
+      const f=Math.max(0,Math.min(1,(cur-a)/Math.max(0.09,b-a)));
+      p=-10+120*f;
+    }
+    p=Math.round(p*2)/2;
+    if(S[i]._p!==p){S[i]._p=p;S[i].style.setProperty('--p',p+'%');}
   }
 }
+function clearWords(S){if(S)S.forEach(w=>{if(w._p!==undefined){w._p=undefined;w.style.removeProperty('--p');}});}
 let WORD_RAF=0;
 function wordLoop(){
   cancelAnimationFrame(WORD_RAF);
   const step=()=>{
-    const cur=audio.currentTime;let alive=false;
+    const cur=smoothTime();let alive=false;
     const S=LYRSYNC;
-    if(S&&S.id===NOW&&!$('#np').hidden&&document.body.contains(S.lines[0]&&S.lines[0].el)){
+    if(S&&S.id===NOW&&!$('#np').hidden&&S.lines[0]&&document.body.contains(S.lines[0].el)){
       alive=true;const L=S.lines[S.idx];if(L&&L.words)paintWords(L,cur,S.lines[S.idx+1]&&S.lines[S.idx+1].t);
     }
-    if(KARA&&KARA.cur&&KARA.cur.words){alive=true;paintWords(KARA.cur,cur,KARA.nextT);}
-    else if(KARA)alive=true;
+    if(KARA){alive=true;if(KARA.cur&&KARA.cur.words)paintWords(KARA.cur,cur,KARA.nextT);}
     if(alive)WORD_RAF=requestAnimationFrame(step);
   };
   WORD_RAF=requestAnimationFrame(step);
@@ -2622,7 +2678,7 @@ function followLyrics(cur,jump){
   if(k===S.idx&&!jump)return;
   S.idx=k;
   S.lines.forEach((x,i)=>{x.el.classList.toggle('on',i===k);x.el.classList.toggle('past',i<k);
-    if(i!==k&&x.ws)x.ws.forEach(w=>{if(w._s){w._s=0;w.classList.remove('sung','now');w.style.removeProperty('--p');}});});
+    if(i!==k&&x.ws)clearWords(x.ws);});
   if(Date.now()-LYRUSER<4000&&!jump)return;      // let the user read ahead without being yanked back
   const target=S.lines[Math.max(0,k)].el,body=$('#npBody');
   const y=target.offsetTop-body.clientHeight*0.38;
@@ -2727,9 +2783,10 @@ async function findLyricsOnline(id){
 /* ---------- auto-sync: speech recognition times the lyrics ---------- */
 let AS_OK=null,AS_ST=null,AS_POLL=null;const AS_SEEN=new Set();
 const AS_NAMES={base:'Fast',small:'Better','large-v3-turbo':'Best'};
-const asJobFor=id=>AS_ST&&AS_ST.jobs.find(j=>j.track_id===id&&/queued|loading|running/.test(j.state));
+const asJobFor=id=>AS_ST&&AS_ST.jobs.find(j=>j.track_id===id&&/queued|loading|running|matching/.test(j.state));
 function asLabel(j){
   if(j.state==='queued')return 'Waiting…';
+  if(j.state==='matching')return 'Looking for matching lyrics…';
   if(j.state==='loading'){const d=AS_ST&&AS_ST.downloading;
     return d&&d.total?'Downloading model '+Math.min(99,Math.round(d.done/d.total*100))+'%':'Loading model…';}
   return (j.mode==='transcribe'?'Transcribing ':'Syncing ')+Math.round((j.progress||0)*100)+'%';
@@ -2737,7 +2794,7 @@ function asLabel(j){
 async function asRefresh(){
   try{AS_ST=await api('/api/autosync/status');}catch(e){return;}
   AS_OK=AS_ST.available;
-  const live=AS_ST.jobs.some(j=>/queued|loading|running/.test(j.state));
+  const live=AS_ST.jobs.some(j=>/queued|loading|running|matching/.test(j.state));
   AS_ST.jobs.forEach(j=>{
     if(!/done|error/.test(j.state)||AS_SEEN.has(j.id))return;
     AS_SEEN.add(j.id);
@@ -2756,7 +2813,7 @@ async function asRefresh(){
 function asReview(j){
   const r=j.result;if(!r)return;
   const guessed=r.lines.filter(x=>x.guessed).length;
-  const msg=j.mode==='transcribe'?'Transcribed '+j.title+' — check the words and timings':
+  const msg=j.mode==='transcribe'?(r.found?'Found the real lyrics for '+j.title+' on '+r.found.source+' and timed them':'Transcribed '+j.title+' — check the words and timings'):
     'Auto-synced '+j.title+(guessed?' — '+guessed+' line'+(guessed>1?'s':'')+' to check':' — looks good');
   if(document.querySelector('.modal.sync')){toast(msg,false,{label:'Review',fn:()=>syncEditor(j.track_id,r)});return;}
   toast(msg);syncEditor(j.track_id,r);
@@ -2764,11 +2821,13 @@ function asReview(j){
 async function startAutosync(id,transcribe){
   if(AS_OK===null)await asRefresh();
   if(!AS_OK){toast(AS_ST&&AS_ST.reason||'Auto-sync isn\'t available',true);return;}
-  const m=AS_ST.model;
+  const m=transcribe&&AS_ST.transcribe_model&&AS_ST.transcribe_model!=='same'?AS_ST.transcribe_model:AS_ST.model;
   if(!AS_ST.ready[m]&&!(AS_ST.downloading)){
     const mb=Math.round(AS_ST.sizes[m]/1e6);
     if(!confirm('Auto-sync needs a speech model ('+(AS_NAMES[m]||m)+', about '+(mb>=1000?(mb/1000).toFixed(1)+' GB':mb+' MB')+').\n\n'+
-      'It downloads once and stays on this PC — nothing is uploaded. You can pick a smaller or better model in Settings → Lyrics auto-sync.\n\nDownload it now?'))return;
+      'It downloads once and stays on this PC — nothing is uploaded. You can pick a smaller or better model in Settings → Lyrics auto-sync.'+
+      (transcribe&&m==='large-v3-turbo'?'\n\nThis is the most accurate one, used for Transcribe because writing lyrics down from scratch is the hardest job. It is slower: a few minutes per song on most PCs.':'')+
+      '\n\nDownload it now?'))return;
   }
   try{await post('/api/autosync',{id});}catch(e){toast(e.message,true);return;}
   toast(transcribe?'Listening to the song and writing down the words…':'Listening to the song and timing your lyrics…');
@@ -2780,8 +2839,10 @@ function asRenderSettings(){
   if(document.activeElement!==sel)sel.value=AS_ST.model;
   if(document.activeElement!==$('#cfgAsLang'))$('#cfgAsLang').value=AS_ST.language||'';
   $('#cfgAsPrecise').checked=AS_ST.precise!==false;
+  if(document.activeElement!==$('#cfgTrModel'))$('#cfgTrModel').value=AS_ST.transcribe_model||'same';
+  $('#cfgTrLook').checked=AS_ST.transcribe_lookup!==false;
   sel.disabled=!AS_ST.available;$('#btnAsAll').disabled=!AS_ST.available;
-  const live=AS_ST.jobs.filter(j=>/queued|loading|running/.test(j.state));
+  const live=AS_ST.jobs.filter(j=>/queued|loading|running|matching/.test(j.state));
   if(!AS_ST.available){st.textContent=AS_ST.reason;st.className='dstat bad';}
   else if(AS_ST.downloading){const d=AS_ST.downloading;st.textContent='Downloading the '+(AS_NAMES[d.name]||d.name)+' model… '+
     (d.total?Math.min(99,Math.round(d.done/d.total*100))+'%':'');st.className='dstat';}
@@ -2794,7 +2855,7 @@ function asRenderSettings(){
   box.appendChild(el('div','','<span><b>'+saved+' saved</b>'+(rev.length?' · '+rev.length+' to check':'')+(live.length?' · '+live.length+' to go':'')+'</span>'));
   AS_ST.jobs.filter(j=>j.autosave).forEach(j=>{
     let right;
-    if(/queued|loading|running/.test(j.state))right='<span>'+esc(asLabel(j))+'</span>';
+    if(/queued|loading|running|matching/.test(j.state))right='<span>'+esc(asLabel(j))+'</span>';
     else if(j.state==='error')right='<span style="color:var(--warn)">'+esc(j.error)+'</span>';
     else if(j.state==='cancelled')right='<span>stopped</span>';
     else if(j.saved)right='<span style="color:#3ddc84">saved · '+Math.round((j.confidence||0)*100)+'% sure</span>';
@@ -2807,6 +2868,8 @@ function asRenderSettings(){
 $('#cfgAsModel').onchange=async e=>{await saveCfg({autosync_model:e.target.value});asRefresh();};
 $('#cfgAsLang').onchange=async e=>{await saveCfg({autosync_language:e.target.value});asRefresh();};
 $('#cfgAsPrecise').onchange=async e=>{await saveCfg({autosync_precise:e.target.checked});asRefresh();};
+$('#cfgTrModel').onchange=async e=>{await saveCfg({transcribe_model:e.target.value});asRefresh();};
+$('#cfgTrLook').onchange=async e=>{await saveCfg({transcribe_lookup:e.target.checked});asRefresh();};
 $('#btnAsAll').onclick=async()=>{
   if(AS_OK===null)await asRefresh();
   const m=AS_ST.model;
@@ -2837,6 +2900,7 @@ async function syncEditor(id,preset){
   if(NOW!==id)playList([id],id);
   closeNP();
   let next=preset?lines.findIndex(x=>x.guess):lines.findIndex(x=>x.t==null);if(next<0)next=preset?0:lines.length;
+  let EDITED=false;
   const t=meta(id);
   const w=el('div','modal sync');
   w.innerHTML='<div class="box" style="max-width:720px;height:88vh"><div class="h">'+(preset?'Check auto-sync — ':'Sync lyrics — ')+esc(ttl(t))+'</div>'+
@@ -2847,7 +2911,10 @@ async function syncEditor(id,preset){
     (preset?'<div class="synchint"><b>AURA timed these by listening'+(preset.lines.some(x=>x.words)?', word by word':'')+'.</b> Play it through and watch the highlight. Lines marked <b style="color:var(--warn)">check</b> '+
       'were hard to hear — their times are a guess. To fix a line, click its time and tap from there, or nudge it with −/+.</div>':'')+
     '<div class="synchint">Press <kbd>Space</kbd> (or the Tap button) right as each highlighted line starts. <kbd>Backspace</kbd> undoes a tap. '+
-    'Click a time to jump there and re-tap from that line. <b>−</b>/<b>+</b> nudge a line by a tenth of a second.</div>'+
+    'Click a time to jump there and re-tap from that line. <b>−</b>/<b>+</b> nudge a line by a tenth of a second. <b>Double-click the words</b> of a line to fix them.</div>'+
+    (preset&&preset.found?'<div class="foundbar"><span><b>Found the real lyrics on '+esc(preset.found.source)+'</b> — '+esc(preset.found.title)+
+      (preset.found.artist?' by '+esc(preset.found.artist):'')+'. They matched what AURA heard, so these are used instead of its own guess.</span>'+
+      '<button class="btn sm" id="syHeard">Use what it heard instead</button></div>':'')+
     '<div class="b" id="syList" style="flex:1"></div><div class="f"><span class="count" id="syCount" style="margin-right:auto"></span>'+
     '<button class="btn" id="syX">Cancel</button><button class="btn primary" id="syS">Save</button></div></div>';
   document.body.appendChild(w);
@@ -2862,7 +2929,24 @@ async function syncEditor(id,preset){
       const mi=el('button','ib sm','−'),pl=el('button','ib sm','+');
       mi.onclick=()=>{if(x.t!=null){x.t=Math.max(0,+(x.t-0.1).toFixed(2));x.guess=false;draw();}};
       pl.onclick=()=>{if(x.t!=null){x.t=+(x.t+0.1).toFixed(2);x.guess=false;draw();}};
-      r.appendChild(tt);r.appendChild(el('span','tx',esc(x.text)));r.appendChild(mi);r.appendChild(pl);L.appendChild(r);
+      const tx=el('span','tx',esc(x.text));tx.title='Double-click to fix the words';
+      tx.ondblclick=()=>{
+        const inp=document.createElement('input');inp.value=x.text;tx.innerHTML='';tx.appendChild(inp);inp.focus();inp.select();
+        const done=keep=>{
+          const v=inp.value.replace(/\s+/g,' ').trim();
+          if(keep&&v&&v!==x.text){
+            // keep the line word by word: spread the new words over the same stretch of the song
+            if(x.words&&x.words.length){const a=x.words[0].t,b=x.end!=null?x.end:x.words[x.words.length-1].t+0.4,ws=v.split(' ');
+              const tot=ws.reduce((n,w2)=>n+Math.max(1,w2.length),0);let acc=0;
+              x.words=ws.map(w2=>{const o={t:+(a+(b-a)*acc/tot).toFixed(2),w:w2};acc+=Math.max(1,w2.length);return o;});}
+            x.text=v;x.guess=false;EDITED=true;
+          }
+          draw(false);
+        };
+        inp.onkeydown=e=>{e.stopPropagation();if(e.key==='Enter')done(true);else if(e.key==='Escape')done(false);};
+        inp.onblur=()=>done(true);
+      };
+      r.appendChild(tt);r.appendChild(tx);r.appendChild(mi);r.appendChild(pl);L.appendChild(r);
       if(i===next&&scroll!==false)setTimeout(()=>r.scrollIntoView({block:'center'}),0);
     });
     const n=lines.filter(x=>x.t!=null).length,g=lines.filter(x=>x.guess).length;
@@ -2902,12 +2986,16 @@ async function syncEditor(id,preset){
   $('#syBack').onclick=()=>{audio.currentTime=Math.max(0,audio.currentTime-5);};
   $('#syFwd').onclick=()=>{audio.currentTime=audio.currentTime+5;};
   $('#syTap').onclick=tap;$('#syUndo').onclick=undo;$('#syX').onclick=close;
+  if($('#syHeard'))$('#syHeard').onclick=()=>{close();syncEditor(id,preset.heard);};
   $('#syS').onclick=async()=>{
     const timed=lines.filter(x=>x.t!=null);
     if(!timed.length){toast('Tap at least one line first',true);return;}
     if(timed.length<lines.length&&!confirm((lines.length-timed.length)+' lines have no time yet and won\'t move with the song. Save anyway?'))return;
-    const text=preset?lines.map(x=>x.text).join('\n'):d.lyrics;
-    try{await post('/api/lyrics/'+id,{lyrics:preset&&preset.lyrics?preset.lyrics:text,synced:timed.map(withWords)});}catch(e){toast(e.message,true);return;}
+    // the full text: the original with its blank lines, with any lines you fixed swapped in
+    let text=(preset&&preset.lyrics)||d.lyrics||lines.map(x=>x.text).join('\n');
+    if(EDITED){const src=text.split('\n');let k=0;const filled=src.filter(x=>x.trim()).length;
+      text=filled===lines.length?src.map(x=>x.trim()?lines[k++].text:x).join('\n'):lines.map(x=>x.text).join('\n');}
+    try{await post('/api/lyrics/'+id,{lyrics:text,synced:timed.map(withWords)});}catch(e){toast(e.message,true);return;}
     close();LYR.delete(id);markLyrics(id,true,true);toast('Synced lyrics saved — they\'ll follow the song');
     openNP('lyrics');$('#npBody')._lyrFor=null;renderNP();
   };
@@ -3496,46 +3584,135 @@ function loopUI(){
 $('#npAB').onclick=()=>{if(!LOOP||LOOP.id!==NOW)setLoopPoint('a');else if(LOOP.b==null)setLoopPoint('b');else clearLoop();};
 $('#pAB').onclick=()=>clearLoop();
 
-/* ---------- karaoke: full-screen lyrics ---------- */
+/* ---------- full-screen lyrics: a flight through space ---------- */
 let KARA=null;
+function karaColors(w,id,has){
+  // tint the nebula with the cover's own colours
+  if(!has)return;
+  const im=new Image();im.onload=()=>{try{
+    const c=document.createElement('canvas');c.width=c.height=24;const x=c.getContext('2d');x.drawImage(im,0,0,24,24);
+    const d=x.getImageData(0,0,24,24).data;let best=null,bs=-1,sec=null,ss=-1;
+    for(let i=0;i<d.length;i+=4){const r=d[i],g=d[i+1],b=d[i+2],mx=Math.max(r,g,b),mn=Math.min(r,g,b);
+      const sat=mx?(mx-mn)/mx:0,val=mx/255,sc=sat*(0.35+val*0.65);
+      if(sc>bs){bs=sc;best=[r,g,b];}}
+    if(!best||bs<0.12)return;
+    const hueOf=([r,g,b])=>{const mx=Math.max(r,g,b),mn=Math.min(r,g,b),dl=mx-mn||1;return mx===r?((g-b)/dl+6)%6:mx===g?(b-r)/dl+2:(r-g)/dl+4;};
+    const h1=hueOf(best);
+    for(let i=0;i<d.length;i+=4){const r=d[i],g=d[i+1],b=d[i+2],mx=Math.max(r,g,b),mn=Math.min(r,g,b);
+      const sat=mx?(mx-mn)/mx:0,dh=Math.abs(hueOf([r,g,b])-h1),far=Math.min(dh,6-dh);
+      const sc=sat*(mx/255)*(far>0.8?1:0.15);if(sc>ss){ss=sc;sec=[r,g,b];}}
+    const lift=c3=>{const m=Math.max(...c3)||1,k=Math.max(1,170/m);return 'rgb('+c3.map(v=>Math.min(255,Math.round(v*k))).join(',')+')';};
+    if(KARA&&KARA.id===id){w.style.setProperty('--k1',lift(best));w.style.setProperty('--k2',lift(ss>0.1&&sec?sec:best));}
+  }catch(e){}};im.src='/api/art/'+id;
+}
+function karaStars(cv){
+  const ctx=cv.getContext('2d');let W=0,H=0,dpr=1;
+  const N=760,stars=[];const rnd=(a,b)=>a+Math.random()*(b-a);
+  const seed=s=>{s.x=rnd(-1,1);s.y=rnd(-1,1);s.z=rnd(0.05,1);s.tw=rnd(0,6.28);s.c=Math.random()<0.18?'#bcd4ff':Math.random()<0.1?'#ffe2c4':'#ffffff';s.big=Math.random()<0.035;return s;};
+  for(let i=0;i<N;i++)stars.push(seed({}));
+  let shoot=null,last=performance.now(),energy=0,buf=null;
+  const still=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const size=()=>{dpr=Math.min(2,window.devicePixelRatio||1);const r=cv.getBoundingClientRect();W=cv.width=Math.max(2,Math.round(r.width*dpr));H=cv.height=Math.max(2,Math.round(r.height*dpr));};
+  size();window.addEventListener('resize',size);
+  const frame=now=>{
+    if(!KARA||!document.body.contains(cv)){window.removeEventListener('resize',size);return;}
+    const dt=Math.min(0.05,(now-last)/1000);last=now;
+    // how hard the low end is hitting right now
+    let e=0;const an=GRAPH&&GRAPH.an;
+    if(an&&!audio.paused){if(!buf)buf=new Uint8Array(an.frequencyBinCount);an.getByteFrequencyData(buf);for(let i=1;i<7;i++)e+=buf[i];e=e/(6*255);}
+    energy+=(e-energy)*(e>energy?0.35:0.08);
+    const w=$('#kara');if(w)w.style.setProperty('--kp',energy.toFixed(3));
+    const speed=still?0.012:(audio.paused?0.012:0.035+energy*0.22);
+    ctx.clearRect(0,0,W,H);
+    const cx=W/2,cy=H/2,f=Math.max(W,H)*0.55;
+    for(const s of stars){
+      const pz=s.z;s.z-=speed*dt;s.tw+=dt*2.2;
+      if(s.z<=0.02){seed(s);s.z=1;continue;}
+      const x=cx+s.x/s.z*f,y=cy+s.y/s.z*f;
+      if(x<-20||x>W+20||y<-20||y>H+20){seed(s);s.z=1;continue;}
+      const near=1-s.z,r=(0.6+near*2.1)*dpr*(s.big?1.7:1),al=Math.min(1,0.34+near*0.9)*(0.7+0.3*Math.sin(s.tw));
+      ctx.globalAlpha=al;ctx.fillStyle=s.c;
+      if(speed>0.09&&near>0.35){                     // streak when flying fast
+        const px=cx+s.x/pz*f,py=cy+s.y/pz*f;ctx.strokeStyle=s.c;ctx.lineWidth=r;ctx.lineCap='round';
+        ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(x,y);ctx.stroke();
+      }else{ctx.beginPath();ctx.arc(x,y,r,0,6.283);ctx.fill();
+        if(s.big&&near>0.25){                        // the brightest ones sparkle
+          const L=r*5;ctx.globalAlpha=al*0.5;ctx.fillRect(x-L,y-0.5*dpr,L*2,dpr);ctx.fillRect(x-0.5*dpr,y-L,dpr,L*2);
+          ctx.globalAlpha=al*0.16;ctx.beginPath();ctx.arc(x,y,r*3.2,0,6.283);ctx.fill();}
+      }
+    }
+    // now and then, a shooting star
+    if(!still&&!shoot&&Math.random()<dt/9)shoot={x:rnd(0.1,0.9)*W,y:rnd(0,0.35)*H,vx:rnd(-1,1)>0?1:-1,t:0};
+    if(shoot){shoot.t+=dt;const L=shoot.t*1600*dpr,x2=shoot.x+shoot.vx*L,y2=shoot.y+L*0.45,a=Math.max(0,1-shoot.t/0.7);
+      const g=ctx.createLinearGradient(x2,y2,x2-shoot.vx*170*dpr,y2-76*dpr);g.addColorStop(0,'rgba(255,255,255,'+a+')');g.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.globalAlpha=1;ctx.strokeStyle=g;ctx.lineWidth=2*dpr;ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-shoot.vx*170*dpr,y2-76*dpr);ctx.stroke();
+      if(shoot.t>0.7)shoot=null;}
+    ctx.globalAlpha=1;
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
 async function karaOpen(refresh){
   if(NOW==null){toast('Play a song first');return;}
   const t=meta(NOW);const d=await lyricsData(NOW);
   if(!refresh&&!d.lyrics){toast('This song has no lyrics yet — add or find them first',true);return;}
-  let w=$('#kara');
-  if(!w){
-    w=el('div','kara');w.id='kara';document.body.appendChild(w);
-    w.addEventListener('dblclick',()=>karaClose());
-    try{if(!refresh&&w.requestFullscreen)w.requestFullscreen().catch(()=>{});}catch(e){}
+  let w=$('#kara');const fresh=!w;
+  if(fresh){
+    w=el('div','kara');w.id='kara';
+    w.innerHTML='<canvas class="kstars"></canvas><div class="kneb n1"></div><div class="kneb n2"></div><div class="kneb n3"></div><div class="kvig"></div>'+
+      '<div class="ktopbar"><span class="khint">Esc to close · click a line to jump there</span><button class="ib" id="kX" title="Close">'+I.x+'</button></div>'+
+      '<div class="kwrap"><div class="kleft"><div class="korbit"><div class="kring"><i></i></div><div class="kring r2"><i></i></div><div class="kart" id="kArt"></div></div>'+
+        '<div class="ktt" id="kTt"></div><div class="kta" id="kTa"></div><div class="kmeta" id="kMeta"></div></div><div id="kBody" style="flex:1;min-width:0;height:100%;display:flex"></div></div>'+
+      '<div class="kbot"><button class="ib" id="kPrev">'+I.prev+'</button><button class="ib" id="kPlay"></button>'+
+        '<button class="ib" id="kNext">'+I.next+'</button><span class="tm" id="kCur">0:00</span><div class="kprog" id="kProg"><i id="kBar"></i></div><span class="tm" id="kDur">0:00</span></div>';
+    document.body.appendChild(w);
+    $('#kX').onclick=karaClose;$('#kPrev').onclick=prev;$('#kNext').onclick=()=>next(false);
+    $('#kPlay').onclick=()=>$('#pPlay').click();
+    $('#kProg').onclick=e=>{const r=$('#kProg').getBoundingClientRect();if(audio.duration)audio.currentTime=audio.duration*(e.clientX-r.left)/r.width;};
+    let idle=0;const wake=()=>{w.classList.remove('idle');clearTimeout(idle);idle=setTimeout(()=>w.classList.add('idle'),3200);};
+    w.addEventListener('mousemove',wake);wake();
+    try{if(w.requestFullscreen)w.requestFullscreen().catch(()=>{});}catch(e){}
   }
-  w.innerHTML='<div class="kbg"'+(t.has_art?' style="background-image:url(\'/api/art/'+t.id+'\')"':'')+'></div>'+
-    '<div class="ktop">'+(t.has_art?'<img src="/api/art/'+t.id+'">':'<div class="kph"></div>')+
-      '<div><div class="ktt">'+esc(ttl(t))+'</div><div class="kta">'+esc(artistOf(t))+'</div></div><div class="sp" style="flex:1"></div>'+
-      '<span class="khint">Esc to close</span><button class="ib" id="kX" title="Close">'+I.x+'</button></div>'+
-    (d.synced&&d.synced.length?'<div class="klines" id="kL"></div>':'<div class="kplain" id="kP"><div>'+esc(d.lyrics||'No lyrics for this song.')+'</div></div>')+
-    '<div class="kbot"><button class="ib" id="kPrev">'+I.prev+'</button><button class="ib" id="kPlay">'+(audio.paused?I.play:I.pause)+'</button>'+
-      '<button class="ib" id="kNext">'+I.next+'</button><span class="tm" id="kCur" style="color:#fffc">0:00</span><div class="kprog"><i id="kBar"></i></div><span class="tm" id="kDur" style="color:#fffc">0:00</span></div>';
-  $('#kX').onclick=karaClose;$('#kPrev').onclick=prev;$('#kNext').onclick=()=>next(false);
-  $('#kPlay').onclick=()=>{$('#pPlay').click();setTimeout(()=>{const b=$('#kPlay');if(b)b.innerHTML=audio.paused?I.play:I.pause;},60);};
-  KARA={id:NOW,lines:(d.synced||[]).filter(x=>x.text),idx:-2,cur:null};
+  w.style.removeProperty('--k1');w.style.removeProperty('--k2');
+  $('#kArt').innerHTML=t.has_art?'<img src="/api/art/'+t.id+'" alt="">':I.note;
+  $('#kTt').textContent=ttl(t);$('#kTa').textContent=artistOf(t);
+  $('#kMeta').textContent=[t.era,(t.year||'').slice(0,4),t.version_label].filter(Boolean).join('  ·  ');
+  const lines=(d.synced||[]).filter(x=>x.text);
+  const body=$('#kBody');
+  KARA={id:NOW,lines,idx:-2,cur:null,els:[]};
+  if(lines.length){
+    body.innerHTML='<div class="kright" id="kL"><div class="kcol" id="kCol"></div></div>';
+    const col=$('#kCol');
+    lines.forEach((ln,k)=>{
+      const byw=ln.words&&ln.words.length;
+      const x=el('div','kl'+(byw?' byw':''),byw?wordSpans(ln.words):esc(ln.text));
+      x.onclick=()=>{audio.currentTime=Math.max(0,ln.t-0.05);if(audio.paused)audio.play().catch(()=>{});};
+      col.appendChild(x);KARA.els.push({el:x,ws:byw?[...x.querySelectorAll('.w')]:null});
+    });
+  }else body.innerHTML='<div class="kplain" id="kP"><div>'+esc(d.lyrics||'No lyrics for this song.')+'</div></div>';
+  karaColors(w,t.id,t.has_art);
+  if(fresh)karaStars(w.querySelector('canvas.kstars'));
   karaTick(audio.currentTime,audio.duration||0);wordLoop();
 }
+function karaPlace(i){
+  const col=$('#kCol'),box=$('#kL');if(!col||!box)return;
+  const e=KARA.els[Math.max(0,i)];if(!e)return;
+  col.style.transform='translateY('+Math.round(box.clientHeight*0.44-e.el.offsetTop-e.el.offsetHeight/2)+'px)';
+}
+window.addEventListener('resize',()=>{if(KARA&&KARA.els&&KARA.els.length)karaPlace(KARA.idx);});
 function karaTick(cur,dur){
   if(!KARA||!$('#kara'))return;
   $('#kCur').textContent=tm(cur);$('#kDur').textContent=tm(dur);$('#kBar').style.width=(dur?100*cur/dur:0)+'%';
-  const b=$('#kPlay');if(b)b.innerHTML=audio.paused?I.play:I.pause;
+  const b=$('#kPlay');if(b&&b._p!==audio.paused){b._p=audio.paused;b.innerHTML=audio.paused?I.play:I.pause;}
   if(KARA.lines.length){
     let i=-1;for(let k=0;k<KARA.lines.length;k++){if(KARA.lines[k].t<=cur+0.05)i=k;else break;}
     if(i===KARA.idx)return;KARA.idx=i;
-    const L=$('#kL');L.innerHTML='';
-    KARA.cur=null;
-    for(let k=Math.max(0,i-1);k<=Math.min(KARA.lines.length-1,Math.max(i,0)+3);k++){
-      const ln=KARA.lines[k],byw=k===i&&ln.words&&ln.words.length;
-      const x=el('div','kl'+(k===i?' cur':k<i?' past':'')+(byw?' byw':''),byw?wordSpans(ln.words):esc(ln.text));
-      x.onclick=()=>{audio.currentTime=KARA.lines[k].t;};L.appendChild(x);
-      if(byw){KARA.cur={words:ln.words,end:ln.end,ws:[...x.querySelectorAll('.w')]};KARA.nextT=KARA.lines[k+1]&&KARA.lines[k+1].t;}
-    }
-    if(i<0){const x=L.firstChild;if(x)x.classList.add('cur');}
+    KARA.els.forEach((e,k)=>{e.el.classList.toggle('cur',k===i);e.el.classList.toggle('near',k!==i&&Math.abs(k-Math.max(i,0))<=1);
+      if(k!==i)clearWords(e.ws);});
+    const ln=KARA.lines[i],e=KARA.els[i];
+    KARA.cur=ln&&e&&e.ws?{words:ln.words,end:ln.end,ws:e.ws}:null;
+    KARA.nextT=KARA.lines[i+1]&&KARA.lines[i+1].t;
+    karaPlace(i);
   }else{
     const P=$('#kP');if(P&&dur){const inner=P.firstChild;const max=inner.scrollHeight-P.clientHeight;P.scrollTop=max*Math.min(1,cur/dur);}
   }
@@ -3545,7 +3722,6 @@ function karaClose(){
   try{if(document.fullscreenElement)document.exitFullscreen();}catch(e){}
   if(w)w.remove();
 }
-document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement&&KARA&&$('#kara')&&!KARA.keep){}});
 
 /* ---------- history ---------- */
 let QTAB='next';

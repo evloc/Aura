@@ -92,8 +92,16 @@ it waits a few seconds before following the song again. Timings come from:
   their own time. When it's done you get a review window: lines it couldn't hear clearly are marked **check**
   and their times are a guess — click a time and re-tap, or nudge with `−`/`+`.
 - **Transcribe** — for a song with no lyrics anywhere, AURA writes the words
-  down itself, already timed. Expect to fix some words, especially on
-  autotuned or mumbled parts.
+  down itself, already timed. It uses the most accurate model for this (**Best**,
+  a 1.6 GB download the first time, a few minutes per song). Then it looks
+  online for real lyrics that match what it heard — by the song's name *and* by
+  the lines themselves, so it works even when the file is named differently —
+  and if it finds them, uses those words instead and times them to your song
+  (a snippet gets just its own part). The review window says so, and **Use what
+  it heard instead** switches back. No speech model hears sung, autotuned
+  vocals perfectly: when nothing matches online, expect to fix some words —
+  **double-click a line** in the review window to correct it; the line stays
+  word by word.
 - **Sync by hand** — play the song and press `Space` right as each highlighted
   line starts (`Backspace` undoes a tap, `−`/`+` nudge a line by 0.1 s, click
   a time to re-tap from there). One listen per song.
@@ -114,6 +122,10 @@ next to the plain lyrics; other formats: LRC text in the lyrics tag).
 but no timings** works through your whole library in the background: songs it's
 confident about are saved straight away, the rest are listed with a **Check**
 link. With **Better**, expect around a minute per song on a typical PC.
+- **Transcribe with** — the model used for Transcribe (Best by default;
+  *Same as auto-sync* if you'd rather not download it).
+- **Look online after transcribing** — the matching against LRCLIB and Genius
+  described above.
 - **Songs are in** — the language of your songs (English by default). Fixing
   it is quicker and more reliable than letting the model guess each time.
 - **Precise word timing** — the second pass. Turn it off for the fastest sync;
@@ -124,9 +136,13 @@ the normal line-by-line lyrics, so other players and your phone still see
 ordinary synced lyrics. Moving a line in the sync window moves its words with
 it; changing a line's text drops the word timings for that line only.
 
-**Full-screen lyrics.** **Full screen** in the lyrics bar (or `K`) shows the
-lyrics karaoke-style: the current line huge, the next lines coming up, the
-cover blurred behind. Click a line to jump there; `Esc` closes it.
+**Full-screen lyrics.** **Full screen** in the lyrics bar (or `K`) opens a
+space scene: a starfield you fly through that speeds up with the bass, glowing
+clouds tinted with the colours of the song's cover, the cover itself floating
+with orbit rings and pulsing to the beat, title, artist and era beside it, and
+the lyrics scrolling smoothly with each word filling in as it's sung. Click a
+line to jump there; the controls fade away when the mouse is still; `Esc`
+closes it.
 
 **Waveform and A–B loop.** The Now Playing seek bar shows the song's shape
 (worked out once per song). **A–B** loops part of a song: press it at the start

@@ -231,6 +231,11 @@ DEFAULT_CONFIG = {
     # Language the songs are sung in ("" = let the model guess each time, slower and
     # sometimes wrong on intros), and the second, precise pass that times every word.
     "autosync_language": "en",
+    # Transcribe (writing the words down from scratch) is the hardest job, so it gets
+    # the most accurate model by default ("same" = use the auto-sync model). After
+    # transcribing, AURA also looks online for real lyrics that match what it heard.
+    "transcribe_model": "large-v3-turbo",
+    "transcribe_lookup": True,
     "autosync_precise": True,
     # Work out BPM and musical key in the background for songs that have none.
     "detect_bpm_key": True,
@@ -1712,13 +1717,14 @@ def lrclib_search(q):
     return out
 
 
-def genius_search(q):
+def genius_search(q, by_lyrics=False):
     data = json.loads(http_text(GENIUS_URL + "/api/search/multi?" + urllib.parse.urlencode({"per_page": 5, "q": q}),
                                 timeout=8))
     out, seen = [], set()
+    kinds = ("song", "lyric") if by_lyrics else ("song",)
     for sec in (data.get("response") or {}).get("sections") or []:
         for hit in sec.get("hits") or []:
-            if hit.get("type") != "song" and sec.get("type") != "song":
+            if hit.get("type") not in kinds and sec.get("type") not in kinds:
                 continue
             r = hit.get("result") or {}
             url = r.get("url") or ""
@@ -2161,6 +2167,65 @@ def refine_forced(model, audio, out, language, should_stop=lambda: False, on_pro
     return accepted, tried
 
 
+def match_heard_lyrics(row, heard_lines, heard_words):
+    """After transcribing: look for real lyrics online that match what was heard.
+    Searches by the song's name and by a few of the heard lines themselves, so it
+    also finds songs whose file is named differently. Returns
+    {"title", "artist", "source", "lines"} or None."""
+    cands, votes = {}, {}
+
+    def add(r, w=1):
+        key = (r["source"], r.get("url") or (_norm_words(r["title"]), _norm_words(r["artist"])))
+        cands.setdefault(key, r)
+        votes[key] = votes.get(key, 0) + w
+
+    try:
+        for r in find_lyrics(row)["results"][:4]:
+            add(r)
+    except Exception:
+        pass
+    long_lines = sorted({ln for ln in heard_lines if 4 <= len(ln.split()) <= 14}, key=lambda x: -len(x))
+    picks = long_lines[:1] + long_lines[len(long_lines) // 2:len(long_lines) // 2 + 1] + long_lines[-1:]
+    jobs = [("p%d" % i, lambda q: genius_search(q, True), " ".join(ln.split()[:10]))
+            for i, ln in enumerate(dict.fromkeys(picks))]
+    if jobs:
+        got, _ = run_parallel(jobs, limit=9.0)
+        for rs in got.values():
+            for r in (rs or [])[:3]:
+                add(r, 2)
+    order = sorted(cands, key=lambda k: -votes[k])[:5]
+    need = [(str(i), genius_lyrics, cands[k]["url"]) for i, k in enumerate(order)
+            if cands[k].get("lyrics") is None and cands[k].get("url")]
+    if need:
+        got, _ = run_parallel(need, limit=10.0)
+        for i, k in enumerate(order):
+            if str(i) in got:
+                cands[k]["lyrics"] = got[str(i)]
+    n_heard = sum(len(_tok(w)) for w, _, _ in heard_words) or 1
+    best = None
+    for k in order:
+        text = cands[k].get("lyrics") or ""
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) < 2:
+            continue
+        out, conf = align_words(lines, heard_words)
+        n_lyr = sum(len(_tok(ln)) for ln in lines) or 1
+        cover = conf * n_lyr / n_heard            # how much of what was heard is in these lyrics
+        if cover < 0.5:
+            continue
+        if conf < 0.5:
+            # the file is only part of the song (a snippet): keep the part that was heard
+            hit = [i for i, o in enumerate(out) if not o["guessed"]]
+            if not hit:
+                continue
+            lines = lines[hit[0]:hit[-1] + 1]
+        score = cover + conf * 0.25
+        if best is None or score > best[0]:
+            best = (score, {"title": cands[k]["title"], "artist": cands[k]["artist"],
+                            "source": "Genius" if cands[k]["source"] == "genius" else "LRCLIB", "lines": lines})
+    return best[1] if best else None
+
+
 def words_to_lines(words, max_words=10, gap=0.6):
     """Turn transcribed words into lyric lines by pauses, punctuation and length.
     -> [(t, text, [(t, word)], end)]"""
@@ -2204,7 +2269,7 @@ def autosync_enqueue(tid, autosave=False):
         return None
     with AS["lock"]:
         for j in AS["jobs"]:
-            if j["track_id"] == tid and j["state"] in ("queued", "running"):
+            if j["track_id"] == tid and j["state"] in ("queued", "running", "loading", "matching"):
                 return j
         j = {"id": AS["next_id"], "track_id": tid, "title": row["title"] or Path(row["filename"]).stem,
              "state": "queued", "progress": 0.0, "mode": None, "confidence": None, "error": "",
@@ -2237,11 +2302,15 @@ def _run_autosync(j):
     audio = np.asarray(audio, dtype=np.float32)
     dur = len(audio) / 16000.0
     j["state"] = "loading"
-    model = get_whisper(cfg.get("autosync_model") or "small")
+    name = cfg.get("autosync_model") or "small"
+    if j["mode"] == "transcribe" and (cfg.get("transcribe_model") or "same") != "same":
+        name = cfg["transcribe_model"]
+    j["model"] = name
+    model = get_whisper(name)
     j["state"] = "running"
     lang = (cfg.get("autosync_language") or "").strip().lower() or None
-    precise = bool(cfg.get("autosync_precise", True)) and j["mode"] == "align"
-    share = 0.7 if precise else 1.0           # how much of the progress bar the first pass gets
+    precise = bool(cfg.get("autosync_precise", True))
+    share = 0.7 if (precise and j["mode"] == "align") else (0.85 if j["mode"] == "transcribe" else 1.0)           # how much of the progress bar the first pass gets
     opts = dict(word_timestamps=True, vad_filter=False, condition_on_previous_text=False, language=lang)
     if j["mode"] == "align":
         # The words are already known, so this pass only has to find where they are:
@@ -2265,25 +2334,31 @@ def _run_autosync(j):
         j["progress"] = round(min(0.99, (seg.end or 0) / dur) * share, 3) if dur else 0.0
         for w in (seg.words or []):
             words.append((w.word, float(w.start), float(w.end)))
-    if j["mode"] == "align":
-        out, conf = align_words(lines, words)
-        j["confidence"] = conf
-        j["note"] = ""
+    def timed(lines_, lyrics_):
+        """Lay known lyric lines over what was heard; then the precise pass."""
+        out, conf = align_words(lines_, words)
+        note = ""
         if precise and any(o["t"] is not None for o in out):
             try:
                 okw, tried = refine_forced(
                     model, audio, out, lang or getattr(info, "language", None) or "en",
                     should_stop=lambda: j["cancel"],
                     on_progress=lambda f: j.__setitem__("progress", round(share + (1 - share) * min(0.99, f), 3)))
-                j["note"] = "precise pass: %d of %d parts" % (okw, tried)
+                note = "precise pass: %d of %d parts" % (okw, tried)
             except Exception as exc:
-                j["note"] = "precise pass skipped (%s)" % (str(exc) or type(exc).__name__)[:120]
+                note = "precise pass skipped (%s)" % (str(exc) or type(exc).__name__)[:120]
             if j["cancel"]:
                 raise _Cancelled()
-        j["result"] = {"lyrics": lyrics, "note": j["note"],
-                       "lines": [{"t": o["t"], "text": o["text"], "guessed": o["guessed"],
-                                  "words": [{"t": t, "w": w} for t, w in o["words"]] if o["words"] else None,
-                                  "end": o["end"]} for o in out]}
+        res = {"lyrics": lyrics_, "note": note,
+               "lines": [{"t": o["t"], "text": o["text"], "guessed": o["guessed"],
+                          "words": [{"t": t, "w": w} for t, w in o["words"]] if o["words"] else None,
+                          "end": o["end"]} for o in out]}
+        return res, out, conf
+
+    if j["mode"] == "align":
+        res, out, conf = timed(lines, lyrics)
+        j["confidence"], j["note"] = conf, res["note"]
+        j["result"] = res
         if j["autosave"] and conf >= 0.6 and all(o["t"] is not None for o in out):
             write_lyrics(row["path"], lyrics, [(o["t"], o["text"]) for o in out],
                          [o["words"] for o in out], [o["end"] for o in out])
@@ -2293,10 +2368,26 @@ def _run_autosync(j):
         lns = words_to_lines(words)
         if not lns:
             raise OSError("no singing was recognised")
-        j["result"] = {"lyrics": "\n".join(tx for _, tx, _, _ in lns), "note": "",
-                       "lines": [{"t": t, "text": tx, "guessed": False,
-                                  "words": [{"t": wt, "w": w} for wt, w in ws] if ws else None, "end": en}
-                                 for t, tx, ws, en in lns]}
+        heard = {"lyrics": "\n".join(tx for _, tx, _, _ in lns), "note": "",
+                 "lines": [{"t": t, "text": tx, "guessed": False,
+                            "words": [{"t": wt, "w": w} for wt, w in ws] if ws else None, "end": en}
+                           for t, tx, ws, en in lns]}
+        j["result"] = heard
+        j["note"] = ""
+        if cfg.get("transcribe_lookup", True):
+            j["state"] = "matching"
+            try:
+                found = match_heard_lyrics(row, [tx for _, tx, _, _ in lns], words)
+            except Exception:
+                found = None
+            j["state"] = "running"
+            if found and not j["cancel"]:
+                res, out, conf = timed(found["lines"], "\n".join(found["lines"]))
+                if all(o["t"] is not None for o in out):
+                    res["found"] = {"title": found["title"], "artist": found["artist"], "source": found["source"]}
+                    res["heard"] = heard
+                    j["confidence"], j["note"] = conf, res["note"]
+                    j["result"] = res
     j["progress"] = 1.0
 
 
@@ -3199,7 +3290,8 @@ def _set_config(body):
     for key in ("folders", "quarantine", "rename_pattern",
                 "write_tags_to_file", "fingerprint", "watch_folders",
                 "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
-                "autosync_model", "detect_bpm_key", "autosync_language", "autosync_precise"):
+                "autosync_model", "detect_bpm_key", "autosync_language", "autosync_precise",
+                "transcribe_model", "transcribe_lookup"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -4082,6 +4174,8 @@ def api_autosync_status():
         jobs = [_job_public(j) for j in AS["jobs"][-60:]]
     return jsonify({"available": ok, "reason": reason, "model": name,
                     "language": cfg.get("autosync_language", "en"), "precise": bool(cfg.get("autosync_precise", True)),
+                    "transcribe_model": cfg.get("transcribe_model") or "same",
+                    "transcribe_lookup": bool(cfg.get("transcribe_lookup", True)),
                     "ready": {k: model_ready(k) for k in AUTOSYNC_MODELS},
                     "sizes": AUTOSYNC_MODELS, "downloading": dl, "jobs": jobs})
 
@@ -4117,7 +4211,7 @@ def api_autosync_cancel():
     jid = body.get("job")
     with AS["lock"]:
         for j in AS["jobs"]:
-            if (jid is None or j["id"] == jid) and j["state"] in ("queued", "running", "loading"):
+            if (jid is None or j["id"] == jid) and j["state"] in ("queued", "running", "loading", "matching"):
                 if j["state"] == "queued":
                     j["state"] = "cancelled"
                 else:
@@ -4128,7 +4222,7 @@ def api_autosync_cancel():
 @app.post("/api/autosync/clear")
 def api_autosync_clear():
     with AS["lock"]:
-        AS["jobs"] = [j for j in AS["jobs"] if j["state"] in ("queued", "running", "loading")]
+        AS["jobs"] = [j for j in AS["jobs"] if j["state"] in ("queued", "running", "loading", "matching")]
     return jsonify({"ok": True})
 
 
