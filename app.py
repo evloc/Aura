@@ -110,7 +110,8 @@ def guard():
     if origin and origin not in ALLOWED_ORIGINS:
         abort(403)
     if request.method != "GET" and request.headers.get("X-Token") != TOKEN:
-        abort(403)
+        if not (request.path == "/api/bye" and request.args.get("t") == TOKEN):
+            abort(403)
     return None
 
 
@@ -236,6 +237,11 @@ DEFAULT_CONFIG = {
     # transcribing, AURA also looks online for real lyrics that match what it heard.
     "transcribe_model": "large-v3-turbo",
     "transcribe_lookup": True,
+    # Separate the voice from the beat before listening: "transcribe" (only when writing
+    # lyrics from scratch), "always" (auto-sync too) or "off".
+    "vocal_isolation": "transcribe",
+    # AURA's own window (WebView2) instead of an Edge app window. Off until tried.
+    "native_window": False,
     "autosync_precise": True,
     # Work out BPM and musical key in the background for songs that have none.
     "detect_bpm_key": True,
@@ -2167,6 +2173,212 @@ def refine_forced(model, audio, out, language, should_stop=lambda: False, on_pro
     return accepted, tried
 
 
+# ---- vocal isolation: take the beat away before listening ----
+#
+# An MDX-Net model (the kind UVR uses), run with onnxruntime. The song is cut into
+# ~6 second pieces, each is turned into a spectrogram, the model keeps the voice,
+# and the pieces are turned back into sound.
+
+VOCAL_MODEL = {
+    "file": "UVR-MDX-NET-Voc_FT.onnx", "size": 66_800_000, "compensate": 1.021,
+    "urls": ["https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Voc_FT.onnx",
+             "https://huggingface.co/seanghay/uvr_models/resolve/main/UVR-MDX-NET-Voc_FT.onnx"],
+}
+VS = {"session": None, "downloading": None, "lock": threading.Lock()}
+
+
+def vocal_model_path():
+    return model_dir() / VOCAL_MODEL["file"]
+
+
+def vocal_model_ready():
+    pth = vocal_model_path()
+    try:
+        return pth.exists() and pth.stat().st_size > 20_000_000
+    except OSError:
+        return False
+
+
+def vocal_engine():
+    import importlib.util
+    try:
+        return sys.modules.get("onnxruntime") is not None or importlib.util.find_spec("onnxruntime") is not None
+    except Exception:
+        return False
+
+
+def download_vocal_model():
+    pth = vocal_model_path()
+    part = pth.with_suffix(".part")
+    last = None
+    for url in VOCAL_MODEL["urls"]:
+        try:
+            VS["downloading"] = {"done": 0, "total": VOCAL_MODEL["size"]}
+            req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+            with urllib.request.urlopen(req, timeout=20) as r, open(part, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0) or VOCAL_MODEL["size"]
+                VS["downloading"]["total"] = total
+                while True:
+                    buf = r.read(1 << 18)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    VS["downloading"]["done"] += len(buf)
+            if part.stat().st_size < 20_000_000:
+                raise OSError("the download was cut short")
+            os.replace(part, pth)
+            return
+        except Exception as exc:
+            last = exc
+        finally:
+            VS["downloading"] = None
+            try:
+                if part.exists():
+                    part.unlink()
+            except OSError:
+                pass
+    raise OSError("couldn't download the vocal model (%s)" % last)
+
+
+def vocal_session():
+    with VS["lock"]:
+        if VS["session"] is None:
+            if not vocal_model_ready():
+                download_vocal_model()
+            import onnxruntime as ort
+            so = ort.SessionOptions()
+            cores = os.cpu_count() or 4
+            so.intra_op_num_threads = max(2, min(12, cores // 2 if cores > 8 else cores))
+            try:
+                VS["session"] = ort.InferenceSession(str(vocal_model_path()), sess_options=so,
+                                                     providers=["CPUExecutionProvider"])
+            except Exception:
+                try:
+                    vocal_model_path().unlink()       # a broken download: fetch it again next time
+                except OSError:
+                    pass
+                raise
+        return VS["session"]
+
+
+def decode_stereo(path, sr=44100, max_seconds=900):
+    """(2, n) float32 at `sr` via PyAV."""
+    import av
+    out, total, limit = [], 0, int(sr * max_seconds)
+    with av.open(str(path)) as inp:
+        stream = next((st for st in inp.streams if st.type == "audio"), None)
+        if stream is None:
+            return None
+        res = av.AudioResampler(format="fltp", layout="stereo", rate=sr)
+        for frame in inp.decode(stream):
+            for rf in res.resample(frame):
+                a = rf.to_ndarray()
+                out.append(a)
+                total += a.shape[1]
+            if total >= limit:
+                break
+    if not out:
+        return None
+    return np.concatenate(out, axis=1)[:, :limit].astype(np.float32)
+
+
+def _mdx_stft(x, n_fft, hop):
+    """Like torch.stft(center=True, hann window): x (rows, n) -> complex (rows, bins, frames)."""
+    win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n_fft) / n_fft)).astype(np.float32)
+    xp = np.pad(x, ((0, 0), (n_fft // 2, n_fft // 2)), mode="reflect")
+    frames = 1 + (xp.shape[1] - n_fft) // hop
+    idx = np.arange(n_fft)[None, :] + hop * np.arange(frames)[:, None]
+    return np.fft.rfft(xp[:, idx] * win, axis=-1).transpose(0, 2, 1)
+
+
+def _mdx_istft(X, n_fft, hop):
+    """Inverse of _mdx_stft: complex (rows, bins, frames) -> (rows, hop * (frames - 1))."""
+    win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n_fft) / n_fft)).astype(np.float32)
+    rows, _, frames = X.shape
+    seg = np.fft.irfft(X.transpose(0, 2, 1), n=n_fft, axis=-1).astype(np.float32) * win
+    n = n_fft + hop * (frames - 1)
+    y = np.zeros((rows, n), np.float32)
+    wsum = np.zeros(n, np.float32)
+    w2 = win * win
+    for i in range(frames):
+        y[:, i * hop:i * hop + n_fft] += seg[:, i]
+        wsum[i * hop:i * hop + n_fft] += w2
+    y /= np.maximum(wsum, 1e-8)
+    return y[:, n_fft // 2:n - n_fft // 2]
+
+
+def mdx_separate(sess, mix, should_stop=lambda: False, on_progress=None, compensate=1.0):
+    """mix: (2, n) float32 at 44.1 kHz -> the model's stem, same shape."""
+    inp = sess.get_inputs()[0]
+    dim_f, dim_t = int(inp.shape[2]), int(inp.shape[3])
+    n_fft = {3072: 7680, 2048: 6144, 2560: 5120}.get(dim_f, (dim_f * 5) // 2)
+    hop = 1024
+    n_bins = n_fft // 2 + 1
+    chunk = hop * (dim_t - 1)
+    trim = n_fft // 2
+    gen = chunk - 2 * trim
+    n = mix.shape[1]
+    pad = gen - n % gen
+    mp = np.concatenate([np.zeros((2, trim), np.float32), mix, np.zeros((2, pad), np.float32),
+                         np.zeros((2, trim), np.float32)], axis=1)
+    out = []
+    steps = (n + pad) // gen
+    for k in range(steps):
+        if should_stop():
+            raise _Cancelled()
+        wave = mp[:, k * gen:k * gen + chunk]
+        X = _mdx_stft(wave, n_fft, hop)                               # (2, bins, dim_t)
+        spec = np.stack([X[0].real, X[0].imag, X[1].real, X[1].imag])[None, :, :dim_f, :].astype(np.float32)
+        spec[:, :, :3, :] = 0
+        pred = sess.run(None, {inp.name: spec})[0][0]                 # (4, dim_f, dim_t)
+        full = np.zeros((4, n_bins, dim_t), np.float32)
+        full[:, :dim_f] = pred
+        Y = np.stack([full[0] + 1j * full[1], full[2] + 1j * full[3]])
+        out.append(_mdx_istft(Y, n_fft, hop)[:, trim:-trim])
+        if on_progress:
+            on_progress((k + 1) / float(steps))
+    return (np.concatenate(out, axis=1)[:, :n] * compensate).astype(np.float32)
+
+
+def vocals_look_right(mix_mono, voc_mono):
+    """A separated voice is a *part* of the song. If what came back isn't (silence,
+    noise, or something unrelated), don't use it."""
+    if not np.all(np.isfinite(voc_mono)):
+        return False
+    em, ev = float(np.mean(mix_mono ** 2)), float(np.mean(voc_mono ** 2))
+    if em <= 0 or ev < em * 0.004:
+        return False
+    resid = float(np.mean((mix_mono - voc_mono) ** 2))
+    corr = float(np.mean(mix_mono * voc_mono) / (np.sqrt(em * ev) + 1e-12))
+    return resid < em * 1.02 and corr > 0.25
+
+
+def isolate_vocals(path, should_stop=lambda: False, on_progress=None):
+    """The singing on its own: mono float32 at 16 kHz. Raises if it can't be done well."""
+    import av
+    sess = vocal_session()
+    mix = decode_stereo(path, 44100)
+    if mix is None or mix.shape[1] < 44100:
+        raise OSError("couldn't decode the audio")
+    voc = mdx_separate(sess, mix, should_stop, on_progress, VOCAL_MODEL["compensate"])
+    mono_mix, mono_voc = mix.mean(axis=0), voc.mean(axis=0)
+    if not vocals_look_right(mono_mix, mono_voc):
+        raise OSError("the separated vocals didn't pass the check")
+    res = av.AudioResampler(format="flt", layout="mono", rate=16000)
+    out = []
+    step = 44100 * 10
+    for i in range(0, len(mono_voc), step):
+        fr = av.AudioFrame.from_ndarray(np.ascontiguousarray(mono_voc[None, i:i + step]), format="flt", layout="mono")
+        fr.sample_rate = 44100
+        for rf in res.resample(fr):
+            out.append(rf.to_ndarray().reshape(-1))
+    for rf in res.resample(None):
+        out.append(rf.to_ndarray().reshape(-1))
+    y = np.concatenate(out).astype(np.float32)
+    peak = float(np.max(np.abs(y))) or 1.0
+    return y * min(4.0, 0.9 / peak)
+
+
 def match_heard_lyrics(row, heard_lines, heard_words):
     """After transcribing: look for real lyrics online that match what was heard.
     Searches by the song's name and by a few of the heard lines themselves, so it
@@ -2260,7 +2472,7 @@ def words_to_lines(words, max_words=10, gap=0.6):
 
 def _job_public(j):
     return {k: j.get(k) for k in ("id", "track_id", "title", "state", "progress", "mode", "confidence",
-                                  "error", "saved", "autosave", "result", "note")}
+                                  "error", "saved", "autosave", "result", "note", "iso", "model")}
 
 
 def autosync_enqueue(tid, autosave=False):
@@ -2269,7 +2481,7 @@ def autosync_enqueue(tid, autosave=False):
         return None
     with AS["lock"]:
         for j in AS["jobs"]:
-            if j["track_id"] == tid and j["state"] in ("queued", "running", "loading", "matching"):
+            if j["track_id"] == tid and j["state"] in ("queued", "running", "loading", "matching", "isolating"):
                 return j
         j = {"id": AS["next_id"], "track_id": tid, "title": row["title"] or Path(row["filename"]).stem,
              "state": "queued", "progress": 0.0, "mode": None, "confidence": None, "error": "",
@@ -2301,6 +2513,24 @@ def _run_autosync(j):
         raise OSError("couldn't decode the audio")
     audio = np.asarray(audio, dtype=np.float32)
     dur = len(audio) / 16000.0
+    j["iso"] = ""
+    iso = cfg.get("vocal_isolation") or "off"
+    if (iso == "always" or (iso == "transcribe" and j["mode"] == "transcribe")) and vocal_engine():
+        j["state"] = "isolating"
+        j["progress"] = 0.0
+        try:
+            voc = isolate_vocals(row["path"], should_stop=lambda: j["cancel"],
+                                 on_progress=lambda f: j.__setitem__("progress", round(min(0.99, f), 3)))
+            if abs(len(voc) - len(audio)) < 16000 * 2:
+                audio = voc[:len(audio)] if len(voc) >= len(audio) else np.pad(voc, (0, len(audio) - len(voc)))
+                j["iso"] = "vocals isolated"
+            else:
+                j["iso"] = "isolation skipped (length mismatch)"
+        except _Cancelled:
+            raise
+        except Exception as exc:
+            j["iso"] = "isolation skipped (%s)" % (str(exc) or type(exc).__name__)[:100]
+        j["progress"] = 0.0
     j["state"] = "loading"
     name = cfg.get("autosync_model") or "small"
     if j["mode"] == "transcribe" and (cfg.get("transcribe_model") or "same") != "same":
@@ -2349,7 +2579,7 @@ def _run_autosync(j):
                 note = "precise pass skipped (%s)" % (str(exc) or type(exc).__name__)[:120]
             if j["cancel"]:
                 raise _Cancelled()
-        res = {"lyrics": lyrics_, "note": note,
+        res = {"lyrics": lyrics_, "note": ". ".join(x for x in (j.get("iso"), note) if x),
                "lines": [{"t": o["t"], "text": o["text"], "guessed": o["guessed"],
                           "words": [{"t": t, "w": w} for t, w in o["words"]] if o["words"] else None,
                           "end": o["end"]} for o in out]}
@@ -2368,7 +2598,7 @@ def _run_autosync(j):
         lns = words_to_lines(words)
         if not lns:
             raise OSError("no singing was recognised")
-        heard = {"lyrics": "\n".join(tx for _, tx, _, _ in lns), "note": "",
+        heard = {"lyrics": "\n".join(tx for _, tx, _, _ in lns), "note": j.get("iso") or "",
                  "lines": [{"t": t, "text": tx, "guessed": False,
                             "words": [{"t": wt, "w": w} for wt, w in ws] if ws else None, "end": en}
                            for t, tx, ws, en in lns]}
@@ -2940,7 +3170,8 @@ def _download_and_install(url, size):
         # then starts the updated AURA — so reopening doesn't depend on the installer.
         script = (
             "$ErrorActionPreference='Continue';"
-            "Start-Sleep -Milliseconds 1500;"
+            "try{Wait-Process -Id AURAPID -Timeout 20}catch{};"
+            "Start-Sleep -Milliseconds 700;"
             "$p=Start-Process -FilePath %s -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"
             "'/CLOSEAPPLICATIONS',%s) -PassThru;"
             "$p.WaitForExit();"
@@ -2949,6 +3180,7 @@ def _download_and_install(url, size):
             "Start-Process -FilePath %s;"
             "Add-Content -LiteralPath %s -Value 'started AURA'"
         ) % (q(dest), q('/LOG="%s"' % log), q(str(log) + ".txt"), q(exe), q(str(log) + ".txt"))
+        script = script.replace("AURAPID", str(os.getpid()))
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -3291,7 +3523,7 @@ def _set_config(body):
                 "write_tags_to_file", "fingerprint", "watch_folders",
                 "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
                 "autosync_model", "detect_bpm_key", "autosync_language", "autosync_precise",
-                "transcribe_model", "transcribe_lookup"):
+                "transcribe_model", "transcribe_lookup", "vocal_isolation", "native_window"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -4175,6 +4407,9 @@ def api_autosync_status():
     return jsonify({"available": ok, "reason": reason, "model": name,
                     "language": cfg.get("autosync_language", "en"), "precise": bool(cfg.get("autosync_precise", True)),
                     "transcribe_model": cfg.get("transcribe_model") or "same",
+                    "vocal": {"mode": cfg.get("vocal_isolation") or "off", "available": vocal_engine(),
+                              "ready": vocal_model_ready(), "size": VOCAL_MODEL["size"],
+                              "downloading": VS["downloading"]},
                     "transcribe_lookup": bool(cfg.get("transcribe_lookup", True)),
                     "ready": {k: model_ready(k) for k in AUTOSYNC_MODELS},
                     "sizes": AUTOSYNC_MODELS, "downloading": dl, "jobs": jobs})
@@ -4211,7 +4446,7 @@ def api_autosync_cancel():
     jid = body.get("job")
     with AS["lock"]:
         for j in AS["jobs"]:
-            if (jid is None or j["id"] == jid) and j["state"] in ("queued", "running", "loading", "matching"):
+            if (jid is None or j["id"] == jid) and j["state"] in ("queued", "running", "loading", "matching", "isolating"):
                 if j["state"] == "queued":
                     j["state"] = "cancelled"
                 else:
@@ -4222,7 +4457,7 @@ def api_autosync_cancel():
 @app.post("/api/autosync/clear")
 def api_autosync_clear():
     with AS["lock"]:
-        AS["jobs"] = [j for j in AS["jobs"] if j["state"] in ("queued", "running", "loading", "matching")]
+        AS["jobs"] = [j for j in AS["jobs"] if j["state"] in ("queued", "running", "loading", "matching", "isolating")]
     return jsonify({"ok": True})
 
 
@@ -4349,6 +4584,13 @@ def api_bg_status():
                      "COUNT(*) AS total FROM tracks WHERE missing=0").fetchone()
     conn.close()
     return jsonify({k: (r[k] or 0) for k in r.keys()})
+
+
+@app.get("/api/app/window")
+def api_app_window():
+    ok, why = native_window_available()
+    return jsonify({"available": ok, "reason": why, "on": bool(load_config().get("native_window")),
+                    "running_native": NATIVE["win"] is not None})
 
 
 @app.get("/api/app/version")
@@ -5368,11 +5610,65 @@ def api_export():
 
 
 LAST_PING = {"t": time.time()}
+WINDOWS = {}                 # window id -> last time it said it was open
+NATIVE = {"win": None, "hello": False, "reverted": False, "full": False}
+
+
+def _busy():
+    return SCAN_STATE["running"] or CONV["running"]
+
+
+def _quit_if_no_windows():
+    """A window said goodbye. If none is left a few seconds later, close AURA."""
+    now = time.time()
+    alive = [w for w, t in WINDOWS.items() if now - t < 70]
+    if alive or _busy() or NATIVE["win"] is not None:
+        return
+    if FROZEN and os.environ.get("UNRELEASED_WATCHDOG") != "0":
+        os._exit(0)
+
+
+@app.post("/api/bye")
+def api_bye():
+    WINDOWS.pop(request.args.get("w") or "", None)
+    threading.Timer(3.0, _quit_if_no_windows).start()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/window")
+def api_window():
+    """Is this AURA showing its own window? `?show=1` brings it to the front
+    (used when AURA is started a second time)."""
+    win = NATIVE["win"]
+    if win is not None and request.args.get("show"):
+        try:
+            win.restore()
+            win.show()
+        except Exception:
+            pass
+    return jsonify({"native": win is not None})
+
+
+@app.post("/api/window/fullscreen")
+def api_window_fullscreen():
+    win = NATIVE["win"]
+    want = bool((request.get_json(silent=True) or {}).get("on"))
+    if win is not None and want != NATIVE["full"]:
+        try:
+            win.toggle_fullscreen()
+            NATIVE["full"] = want
+        except Exception:
+            pass
+    return jsonify({"ok": True, "native": win is not None})
 
 
 @app.post("/api/ping")
 def api_ping():
     LAST_PING["t"] = time.time()
+    NATIVE["hello"] = True
+    wid = (request.get_json(silent=True) or {}).get("w")
+    if wid:
+        WINDOWS[str(wid)[:40]] = time.time()
     return jsonify({"ok": True})
 
 
@@ -5459,6 +5755,82 @@ def open_window(url):
         pass
 
 
+def webview2_installed():
+    """The WebView2 runtime (part of Windows 11, and of most Windows 10 PCs via Edge)."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        guid = r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+        for root, key in ((winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\\" + guid),
+                          (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\\" + guid),
+                          (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\EdgeUpdate\Clients\\" + guid)):
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    pv = winreg.QueryValueEx(k, "pv")[0]
+                    if pv and pv != "0.0.0.0":
+                        return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def native_window_available():
+    if not webview2_installed():
+        return False, "This PC doesn't have Microsoft's WebView2 runtime."
+    import importlib.util
+    try:
+        if importlib.util.find_spec("webview") is None:
+            return False, "This build doesn't include the window component."
+    except Exception:
+        return False, "This build doesn't include the window component."
+    return True, ""
+
+
+def _native_check(url):
+    """Safety net: if AURA's own window never loaded the page, go back to the Edge
+    window for good and say why in error.log."""
+    if NATIVE["hello"] or NATIVE["win"] is None:
+        return
+    NATIVE["reverted"] = True
+    try:
+        _set_config({"native_window": False})
+        (DATA_DIR / "error.log").write_text(
+            "AURA's own window didn't load, so it was switched back to the Edge window.", encoding="utf-8")
+    except Exception:
+        pass
+    win, NATIVE["win"] = NATIVE["win"], None
+    open_window(url)
+    try:
+        win.destroy()
+    except Exception:
+        pass
+
+
+def run_native(url):
+    """Show AURA in its own window. Returns when that window is closed; False if it
+    couldn't be shown at all."""
+    try:
+        import webview
+        webview.settings["ALLOW_DOWNLOADS"] = True
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        win = webview.create_window("AURA", url, width=1500, height=940, min_size=(980, 640),
+                                    background_color="#05060b", text_select=True)
+        NATIVE["win"] = win
+        threading.Timer(30.0, _native_check, args=(url,)).start()
+        webview.start(gui="edgechromium", private_mode=False, storage_path=str(DATA_DIR / "webview"))
+        return True
+    except Exception as exc:
+        NATIVE["win"] = None
+        try:
+            (DATA_DIR / "error.log").write_text("AURA's own window couldn't open: %s" % exc, encoding="utf-8")
+        except Exception:
+            pass
+        return False
+
+
 def existing_instance(port):
     try:
         import urllib.request
@@ -5537,6 +5909,22 @@ def selftest():
     except Exception as exc:
         ok = False
         lines.append("mp3 converter     : FAILED %s" % exc)
+    try:
+        import onnxruntime
+        lines.append("vocal isolation   : ok (onnxruntime %s, model %s)" % (
+            onnxruntime.__version__, "downloaded" if vocal_model_ready() else "not downloaded yet"))
+    except Exception as exc:
+        ok = False
+        lines.append("vocal isolation   : FAILED %s" % exc)
+    navail, nwhy = native_window_available()
+    lines.append("own window        : %s" % ("available" if navail else "not available - %s" % nwhy))
+    if os.name == "nt":
+        try:                       # does the window component actually load in this build?
+            import webview  # noqa: F401
+            import clr  # noqa: F401
+            lines.append("window component  : loads ok (pywebview %s)" % getattr(webview, "__version__", "?"))
+        except Exception as exc:
+            lines.append("window component  : does not load (%s) - AURA will use the Edge window" % exc)
     lines.append("cpu workers       : %d" % max(2, min(8, os.cpu_count() or 4)))
     try:
         lines.append("networking        : ok (can bind 127.0.0.1:%d)" % free_port())
@@ -5565,6 +5953,12 @@ def main():
     fixed = int(os.environ.get("PORT") or 0)
     if not fixed and existing_instance(7788):
         print("%s is already running - opening that window." % APP_NAME)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:7788/api/window?show=1", timeout=3) as r:
+                if json.loads(r.read().decode("utf-8")).get("native"):
+                    return
+        except Exception:
+            pass
         open_window("http://127.0.0.1:7788/")
         return
     port = fixed or free_port()
@@ -5575,8 +5969,11 @@ def main():
     print("  Library and settings: %s" % DATA_DIR)
     print("  Close this window to quit.\n")
 
-    if os.environ.get("NO_BROWSER") != "1":
-        threading.Timer(1.0, lambda: open_window(url)).start()
+    want_native = False
+    if os.environ.get("NO_BROWSER") != "1" and load_config().get("native_window"):
+        want_native = native_window_available()[0]
+    if os.environ.get("NO_BROWSER") != "1" and not want_native:
+        threading.Timer(0.35, lambda: open_window(url)).start()
     threading.Thread(target=folder_watcher, daemon=True).start()
     threading.Thread(target=background_worker, daemon=True).start()
     if FROZEN and os.environ.get("UNRELEASED_WATCHDOG") != "0":
@@ -5586,6 +5983,19 @@ def main():
 
     from werkzeug.serving import make_server
     srv = make_server("127.0.0.1", port, app, threaded=True)
+    if want_native:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        shown = run_native(url)                 # returns when the window is closed
+        if shown and not NATIVE["reverted"]:
+            os._exit(0)                         # own window closed = AURA closed, at once
+        if not shown:
+            open_window(url)
+        NATIVE["win"] = None
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

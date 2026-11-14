@@ -34,11 +34,18 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 
+[InstallDelete]
+; Clear the previous version's program files first, so nothing stale is left behind.
+; (Your library is in %APPDATA%\Unreleased and is not touched.)
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
-Source: "dist\AURA.exe"; DestDir: "{app}"; Flags: ignoreversion
+; The whole program folder (AURA.exe plus its _internal folder). Already unpacked on
+; disk, so AURA opens straight away instead of unpacking itself every time.
+Source: "dist\AURA\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\AURA"; Filename: "{app}\AURA.exe"

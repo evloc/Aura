@@ -1,11 +1,11 @@
 @echo off
 setlocal
-title Building AURA.exe
+title Building AURA
 cd /d "%~dp0"
 
 echo.
 echo  ================================
-echo   Building AURA.exe
+echo   Building AURA
 echo  ================================
 echo.
 
@@ -44,7 +44,7 @@ echo  Installing what AURA needs (first time takes a minute)...
 
 echo.
 echo  Building...
-"%VPY%" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
+"%VPY%" -m PyInstaller --noconfirm --clean --onedir --noconsole ^
   --name AURA --icon icon.ico ^
   --add-data "templates;templates" ^
   --add-data "version.json;." ^
@@ -52,10 +52,14 @@ echo  Building...
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
   --collect-all av ^
+  --collect-all onnxruntime ^
+  --collect-all webview ^
+  --collect-all pythonnet ^
+  --collect-all clr_loader ^
   --hidden-import _cffi_backend ^
   app.py || goto :fail
 
-copy /y "dist\AURA.exe" "AURA.exe" >nul || goto :fail
+if not exist "dist\AURA\AURA.exe" goto :fail
 
 rem ---- the installer, if Inno Setup 6 is installed (free: jrsoftware.org/isdl.php) ----
 set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
@@ -70,12 +74,12 @@ if exist "%ISCC%" (
 
 echo.
 echo  Checking the new exe...
-start "" /wait "AURA.exe" --selftest
+start "" /wait "dist\AURA\AURA.exe" --selftest
 type "%APPDATA%\Unreleased\selftest.txt"
 echo.
 echo  ================================
-echo   Done!  AURA.exe is in this folder:
-echo   %~dp0AURA.exe
+echo   Done!  AURA is in this folder (keep the whole folder together):
+echo   %~dp0dist\AURA\AURA.exe
 echo  ================================
 echo.
 pause

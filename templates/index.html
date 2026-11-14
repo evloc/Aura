@@ -1033,6 +1033,12 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <option value="small">Better — 480 MB</option>
             <option value="base">Fast — 145 MB</option>
             <option value="same">Same as auto-sync</option></select></div>
+          <div class="srow2"><span>Separate the vocals first</span><select class="search" id="cfgVocal" style="max-width:300px">
+            <option value="transcribe">For Transcribe (recommended)</option>
+            <option value="always">Always — auto-sync too (slower)</option>
+            <option value="off">Off</option></select></div>
+          <p style="margin:0 0 8px;font-size:12px">Takes the beat away so only the voice is heard — fewer wrong words on loud beats.
+            Adds a minute or more per song. <span id="vocalNote"></span></p>
           <label class="chk2"><input type="checkbox" id="cfgTrLook"><span>After transcribing, look online for real lyrics that match what was heard
             <span style="color:var(--faint)">(LRCLIB and Genius — fixes misheard words when the song's lyrics exist anywhere)</span></span></label>
           <div class="srow2"><span>Songs are in</span><select class="search" id="cfgAsLang" style="max-width:300px">
@@ -1064,7 +1070,11 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
           <p id="verLine">AURA</p>
           <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" id="btnUpd">Check for updates</button>
             <button class="btn primary sm" id="btnUpdGo" style="display:none">Install update</button></div>
-          <div class="dstat" id="updStat"></div><div class="updbar" id="updBar" style="display:none"><i></i></div></div>
+          <div class="dstat" id="updStat"></div><div class="updbar" id="updBar" style="display:none"><i></i></div>
+          <label class="chk2" style="margin-top:12px"><input type="checkbox" id="cfgNative"><span>Use AURA's own window <span class="src">BETA</span>
+            <span style="color:var(--faint)">— instead of an Edge window. Opens a little faster and AURA closes the moment you close it.
+            If it ever fails to load, AURA switches back by itself. The mini player isn't available in it yet.</span></span></label>
+          <div class="dstat" id="nativeNote"></div></div>
         <div class="card"><h3>Export</h3><p>The whole library as a spreadsheet.</p>
           <button class="btn sm" id="btnExport">Download CSV</button></div>
         <div class="card"><h3>Shortcuts</h3>
@@ -1206,7 +1216,7 @@ function showView(v){
   if(v==='eras')renderEras();
   if(v==='missing')renderMissing();
   if(v==='stats')renderStats();
-  if(v==='settings'){levelNote();asRefresh();cvRefresh();bpmNote();}
+  if(v==='settings'){levelNote();asRefresh();cvRefresh();bpmNote();appWindow();}
 }
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showView(b.dataset.v));
 document.querySelectorAll('#sides button').forEach(b=>b.onclick=()=>showView(LASTV[b.dataset.side]));
@@ -2783,10 +2793,12 @@ async function findLyricsOnline(id){
 /* ---------- auto-sync: speech recognition times the lyrics ---------- */
 let AS_OK=null,AS_ST=null,AS_POLL=null;const AS_SEEN=new Set();
 const AS_NAMES={base:'Fast',small:'Better','large-v3-turbo':'Best'};
-const asJobFor=id=>AS_ST&&AS_ST.jobs.find(j=>j.track_id===id&&/queued|loading|running|matching/.test(j.state));
+const asJobFor=id=>AS_ST&&AS_ST.jobs.find(j=>j.track_id===id&&/queued|loading|running|matching|isolating/.test(j.state));
 function asLabel(j){
   if(j.state==='queued')return 'Waiting…';
   if(j.state==='matching')return 'Looking for matching lyrics…';
+  if(j.state==='isolating'){const d=AS_ST&&AS_ST.vocal&&AS_ST.vocal.downloading;
+    return d&&d.total?'Downloading vocal model '+Math.min(99,Math.round(d.done/d.total*100))+'%':'Separating the vocals '+Math.round((j.progress||0)*100)+'%';}
   if(j.state==='loading'){const d=AS_ST&&AS_ST.downloading;
     return d&&d.total?'Downloading model '+Math.min(99,Math.round(d.done/d.total*100))+'%':'Loading model…';}
   return (j.mode==='transcribe'?'Transcribing ':'Syncing ')+Math.round((j.progress||0)*100)+'%';
@@ -2794,7 +2806,7 @@ function asLabel(j){
 async function asRefresh(){
   try{AS_ST=await api('/api/autosync/status');}catch(e){return;}
   AS_OK=AS_ST.available;
-  const live=AS_ST.jobs.some(j=>/queued|loading|running|matching/.test(j.state));
+  const live=AS_ST.jobs.some(j=>/queued|loading|running|matching|isolating/.test(j.state));
   AS_ST.jobs.forEach(j=>{
     if(!/done|error/.test(j.state)||AS_SEEN.has(j.id))return;
     AS_SEEN.add(j.id);
@@ -2822,12 +2834,16 @@ async function startAutosync(id,transcribe){
   if(AS_OK===null)await asRefresh();
   if(!AS_OK){toast(AS_ST&&AS_ST.reason||'Auto-sync isn\'t available',true);return;}
   const m=transcribe&&AS_ST.transcribe_model&&AS_ST.transcribe_model!=='same'?AS_ST.transcribe_model:AS_ST.model;
-  if(!AS_ST.ready[m]&&!(AS_ST.downloading)){
-    const mb=Math.round(AS_ST.sizes[m]/1e6);
-    if(!confirm('Auto-sync needs a speech model ('+(AS_NAMES[m]||m)+', about '+(mb>=1000?(mb/1000).toFixed(1)+' GB':mb+' MB')+').\n\n'+
-      'It downloads once and stays on this PC — nothing is uploaded. You can pick a smaller or better model in Settings → Lyrics auto-sync.'+
-      (transcribe&&m==='large-v3-turbo'?'\n\nThis is the most accurate one, used for Transcribe because writing lyrics down from scratch is the hardest job. It is slower: a few minutes per song on most PCs.':'')+
-      '\n\nDownload it now?'))return;
+  const V=AS_ST.vocal||{},wantV=V.available&&(V.mode==='always'||(V.mode==='transcribe'&&transcribe));
+  const need=[];
+  if(!AS_ST.ready[m]&&!AS_ST.downloading){const mb=Math.round(AS_ST.sizes[m]/1e6);
+    need.push('• the speech model ('+(AS_NAMES[m]||m)+', about '+(mb>=1000?(mb/1000).toFixed(1)+' GB':mb+' MB')+')');}
+  if(wantV&&!V.ready&&!V.downloading)need.push('• the vocal separation model (about '+Math.round(V.size/1e6)+' MB)');
+  if(need.length){
+    if(!confirm((transcribe?'Transcribe':'Auto-sync')+' needs to download:\n\n'+need.join('\n')+'\n\n'+
+      'They download once and stay on this PC — nothing is uploaded. You can change both in Settings → Lyrics auto-sync.'+
+      (transcribe&&m==='large-v3-turbo'&&!AS_ST.ready[m]?'\n\nThe speech model is the most accurate one, used for Transcribe because writing lyrics down from scratch is the hardest job. It is slower: a few minutes per song on most PCs.':'')+
+      '\n\nDownload now?'))return;
   }
   try{await post('/api/autosync',{id});}catch(e){toast(e.message,true);return;}
   toast(transcribe?'Listening to the song and writing down the words…':'Listening to the song and timing your lyrics…');
@@ -2841,8 +2857,13 @@ function asRenderSettings(){
   $('#cfgAsPrecise').checked=AS_ST.precise!==false;
   if(document.activeElement!==$('#cfgTrModel'))$('#cfgTrModel').value=AS_ST.transcribe_model||'same';
   $('#cfgTrLook').checked=AS_ST.transcribe_lookup!==false;
+  const V=AS_ST.vocal||{};
+  if(document.activeElement!==$('#cfgVocal'))$('#cfgVocal').value=V.mode||'off';
+  $('#cfgVocal').disabled=!V.available;
+  $('#vocalNote').textContent=!V.available?'Not included in this build.':V.downloading?'Downloading the vocal model…':
+    V.ready?'Vocal model downloaded.':'Its model ('+Math.round((V.size||0)/1e6)+' MB) downloads the first time.';
   sel.disabled=!AS_ST.available;$('#btnAsAll').disabled=!AS_ST.available;
-  const live=AS_ST.jobs.filter(j=>/queued|loading|running|matching/.test(j.state));
+  const live=AS_ST.jobs.filter(j=>/queued|loading|running|matching|isolating/.test(j.state));
   if(!AS_ST.available){st.textContent=AS_ST.reason;st.className='dstat bad';}
   else if(AS_ST.downloading){const d=AS_ST.downloading;st.textContent='Downloading the '+(AS_NAMES[d.name]||d.name)+' model… '+
     (d.total?Math.min(99,Math.round(d.done/d.total*100))+'%':'');st.className='dstat';}
@@ -2855,7 +2876,7 @@ function asRenderSettings(){
   box.appendChild(el('div','','<span><b>'+saved+' saved</b>'+(rev.length?' · '+rev.length+' to check':'')+(live.length?' · '+live.length+' to go':'')+'</span>'));
   AS_ST.jobs.filter(j=>j.autosave).forEach(j=>{
     let right;
-    if(/queued|loading|running|matching/.test(j.state))right='<span>'+esc(asLabel(j))+'</span>';
+    if(/queued|loading|running|matching|isolating/.test(j.state))right='<span>'+esc(asLabel(j))+'</span>';
     else if(j.state==='error')right='<span style="color:var(--warn)">'+esc(j.error)+'</span>';
     else if(j.state==='cancelled')right='<span>stopped</span>';
     else if(j.saved)right='<span style="color:#3ddc84">saved · '+Math.round((j.confidence||0)*100)+'% sure</span>';
@@ -2870,6 +2891,7 @@ $('#cfgAsLang').onchange=async e=>{await saveCfg({autosync_language:e.target.val
 $('#cfgAsPrecise').onchange=async e=>{await saveCfg({autosync_precise:e.target.checked});asRefresh();};
 $('#cfgTrModel').onchange=async e=>{await saveCfg({transcribe_model:e.target.value});asRefresh();};
 $('#cfgTrLook').onchange=async e=>{await saveCfg({transcribe_lookup:e.target.checked});asRefresh();};
+$('#cfgVocal').onchange=async e=>{await saveCfg({vocal_isolation:e.target.value});asRefresh();};
 $('#btnAsAll').onclick=async()=>{
   if(AS_OK===null)await asRefresh();
   const m=AS_ST.model;
@@ -2909,7 +2931,8 @@ async function syncEditor(id,preset){
     '<div class="sp"></div><button class="btn" id="syUndo" title="Undo last tap (Backspace)">Undo</button>'+
     '<button class="btn primary tapbtn" id="syTap">Tap — line starts</button></div>'+
     (preset?'<div class="synchint"><b>AURA timed these by listening'+(preset.lines.some(x=>x.words)?', word by word':'')+'.</b> Play it through and watch the highlight. Lines marked <b style="color:var(--warn)">check</b> '+
-      'were hard to hear — their times are a guess. To fix a line, click its time and tap from there, or nudge it with −/+.</div>':'')+
+      'were hard to hear — their times are a guess. To fix a line, click its time and tap from there, or nudge it with −/+.'+
+      (preset.note?'<br><span style="color:var(--faint)">How it went: '+esc(preset.note)+'</span>':'')+'</div>':'')+
     '<div class="synchint">Press <kbd>Space</kbd> (or the Tap button) right as each highlighted line starts. <kbd>Backspace</kbd> undoes a tap. '+
     'Click a time to jump there and re-tap from that line. <b>−</b>/<b>+</b> nudge a line by a tenth of a second. <b>Double-click the words</b> of a line to fix them.</div>'+
     (preset&&preset.found?'<div class="foundbar"><span><b>Found the real lyrics on '+esc(preset.found.source)+'</b> — '+esc(preset.found.title)+
@@ -3014,7 +3037,7 @@ $('#npGo').onclick=()=>{closeNP();showView('songs');SQ='';$('#sq').value='';rend
 /* ---------- mini player: a small always-on-top window ---------- */
 let PIP=null;
 async function openMini(){
-  if(!('documentPictureInPicture' in window)){toast('The mini player needs a recent Edge or Chrome',true);return;}
+  if(!('documentPictureInPicture' in window)){toast(APPWIN.running_native?'The mini player isn\'t available in AURA\'s own window yet — turn that off in Settings → About to use it':'The mini player needs a recent Edge or Chrome',true);return;}
   if(PIP){try{PIP.focus();}catch(e){}return;}
   let w;
   try{w=await documentPictureInPicture.requestWindow({width:400,height:124});}
@@ -3247,6 +3270,7 @@ function updGone(){
   setTimeout(()=>{try{window.close();}catch(e){}},6000);
 }
 $('#btnUpdGo').onclick=installUpdate;
+$('#cfgNative').onchange=async e=>{await saveCfg({native_window:e.target.checked});appWindow();};
 
 /* ---------- eras ---------- */
 let ERA_Q='',ERA_OPEN=null;
@@ -3672,6 +3696,7 @@ async function karaOpen(refresh){
     let idle=0;const wake=()=>{w.classList.remove('idle');clearTimeout(idle);idle=setTimeout(()=>w.classList.add('idle'),3200);};
     w.addEventListener('mousemove',wake);wake();
     try{if(w.requestFullscreen)w.requestFullscreen().catch(()=>{});}catch(e){}
+    if(APPWIN.running_native)post('/api/window/fullscreen',{on:true}).catch(()=>{});
   }
   w.style.removeProperty('--k1');w.style.removeProperty('--k2');
   $('#kArt').innerHTML=t.has_art?'<img src="/api/art/'+t.id+'" alt="">':I.note;
@@ -3720,6 +3745,7 @@ function karaTick(cur,dur){
 function karaClose(){
   const w=$('#kara');KARA=null;
   try{if(document.fullscreenElement)document.exitFullscreen();}catch(e){}
+  if(APPWIN.running_native)post('/api/window/fullscreen',{on:false}).catch(()=>{});
   if(w)w.remove();
 }
 
@@ -4408,8 +4434,20 @@ $('#btnQuit').onclick=async()=>{
   document.body.innerHTML='<div class="empty" style="padding-top:26vh"><h3>AURA has closed</h3><p>You can close this window.</p></div>';
   setTimeout(()=>window.close(),400);
 };
-setInterval(()=>{post('/api/ping').catch(()=>{});},20000);
-post('/api/ping').catch(()=>{});
+const WID=Math.random().toString(36).slice(2)+Date.now().toString(36);
+setInterval(()=>{post('/api/ping',{w:WID}).catch(()=>{});},20000);
+post('/api/ping',{w:WID}).catch(()=>{});
+window.addEventListener('pagehide',()=>{try{navigator.sendBeacon('/api/bye?w='+WID+'&t='+encodeURIComponent(TOKEN),'');}catch(e){}});
+window.addEventListener('pageshow',e=>{if(e.persisted)post('/api/ping',{w:WID}).catch(()=>{});});
+let APPWIN={available:false,on:false,running_native:false};
+async function appWindow(){
+  try{APPWIN=await api('/api/app/window');}catch(e){return;}
+  const c=$('#cfgNative'),n=$('#nativeNote');if(!c)return;
+  c.checked=!!APPWIN.on;c.disabled=!APPWIN.available;
+  n.textContent=!APPWIN.available?APPWIN.reason:APPWIN.on!==APPWIN.running_native?'Takes effect the next time you open AURA.':
+    APPWIN.running_native?'On — this is AURA\'s own window.':'Off — AURA is using an Edge window.';
+}
+appWindow();
 window.onbeforeunload=()=>DIRTY?'Unsaved changes':undefined;
 
 (async function(){

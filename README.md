@@ -12,9 +12,17 @@ real files in place, and it never deletes anything.
 
 ## Running it
 
-Extract the zip, then double-click **`AURA.exe`**. That's the whole
-install — Python, the audio decoder, the database and the interface are all
-inside the one file. Windows 10 or 11, 64-bit.
+Run **`AURA-Setup.exe`** and open AURA from the Start menu. It installs for
+your Windows account only (no admin prompt) as a normal program folder, so it
+opens in a second or two. Windows 10 or 11, 64-bit. (There's also
+`AURA-portable.zip` on the release page: unzip it anywhere and run `AURA.exe`
+inside — keep the whole folder together.)
+
+AURA closes when you close its window. By default that window is an Edge app
+window; **Settings → About → Use AURA's own window (beta)** switches to a
+window of AURA's own (Microsoft's WebView2, built into Windows 11). If that
+ever fails to load, AURA switches back by itself. The mini player isn't
+available in it yet.
 
 First launch asks for your music folder. Point it at one and hit
 **Start scanning**.
@@ -23,9 +31,10 @@ First launch asks for your music folder. Point it at one and hit
 file isn't code-signed. Click **More info → Run anyway**. Anyone you send it to
 will see the same thing, so warn them or it looks broken.
 
-**If it won't start**, open a Command Prompt in the folder and run
-`AURA.exe --selftest`. It prints which part failed and writes the same
-report to `%APPDATA%\Unreleased\selftest.txt`.
+**If it won't start**, run `AURA.exe --selftest` from its folder
+(`%LOCALAPPDATA%\Programs\AURA`). It writes a report of which part failed to
+`%APPDATA%\Unreleased\selftest.txt`; `error.log` in the same folder holds
+the last start-up problem.
 
 ---
 
@@ -102,6 +111,14 @@ it waits a few seconds before following the song again. Timings come from:
   vocals perfectly: when nothing matches online, expect to fix some words —
   **double-click a line** in the review window to correct it; the line stays
   word by word.
+- **Separate the vocals first** — before transcribing, AURA takes the beat
+  away and listens to the voice on its own (a 67 MB vocal-separation model,
+  downloaded the first time; adds a minute or more per song). This is the
+  setting that helps most with wrong words on loud beats. Settings → Lyrics
+  auto-sync: *For Transcribe* (default), *Always* (auto-sync too) or *Off*.
+  If the separated voice doesn't look like a real part of the song, AURA
+  throws it away and listens to the normal sound; the review window's *How it
+  went* line says which happened.
 - **Sync by hand** — play the song and press `Space` right as each highlighted
   line starts (`Backspace` undoes a tap, `−`/`+` nudge a line by 0.1 s, click
   a time to re-tap from there). One listen per song.
@@ -247,8 +264,9 @@ GitHub releases. The one-time setup:
    public so your friends' copies can download updates without a password.
    (`.gitignore` keeps your own library and build files out of it.)
 2. **Release a version:** `git tag v1.0.0` then `git push origin v1.0.0`.
-   GitHub builds `AURA.exe` and `AURA-Setup.exe` on a Windows machine (about
-   10 minutes — watch the **Actions** tab) and publishes them under
+   GitHub builds AURA and `AURA-Setup.exe` on a Windows machine, installs it
+   there the way a user would and tests the installed copy (about 10–15
+   minutes — watch the **Actions** tab) and publishes them under
    **Releases**.
 3. **Send your friend `AURA-Setup.exe`** from that release page. Installing
    needs no admin rights; it adds AURA to the Start menu (and the desktop if
