@@ -254,6 +254,24 @@ returns. Media keys and the Windows media controls work too.
 
 ---
 
+## Looks
+
+Everything here is in **Settings → Player**.
+
+- **Colors follow the song.** AURA picks up the main color of the cover that
+  is playing and uses it for buttons, highlights and the glow behind the
+  player. It fades from one song's color to the next. Turn it off with
+  *Colors follow the song* if you want one fixed color.
+- **Themes.** Midnight, Neon, Sunset, Mono, Light, or Match Windows.
+- **Accent color.** Pick your own color. It is used when a song has no cover,
+  or all the time when *Colors follow the song* is off.
+- **Now Playing.** A bigger cover over a soft backdrop made from the cover's
+  colors. The cover eases back a little while paused.
+- **Full-screen lyric scenes.** Space, Ocean, Neon city and Glow. Choose one
+  in Settings or press the scene button in full-screen lyrics to switch. They
+  move with the bass of the song.
+- **Compact song list.** Smaller rows, so more songs fit on screen.
+
 ## Sharing AURA and updating it
 
 AURA can be installed from a normal setup file and updates itself from your
