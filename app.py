@@ -243,6 +243,9 @@ DEFAULT_CONFIG = {
     # AURA's own window (WebView2) instead of an Edge app window. Off until tried.
     "native_window": False,
     "autosync_precise": True,
+    # Look online (LRCLIB, then Genius) for the lyrics of songs that have none, by
+    # itself in the background. Only a confident title + artist match is saved.
+    "auto_lyrics": True,
     # Work out BPM and musical key in the background for songs that have none.
     "detect_bpm_key": True,
     # Values stamped onto every track by the auto-fill tool.
@@ -263,7 +266,8 @@ def init_db():
                           ("has_synced", "INTEGER DEFAULT 0"),
                           ("gain_db", "REAL"),
                           ("era", "TEXT DEFAULT ''"),
-                          ("analysed", "INTEGER DEFAULT 0")]:
+                          ("analysed", "INTEGER DEFAULT 0"),
+                          ("lyr_tried", "REAL")]:
             if col not in have:
                 conn.execute("ALTER TABLE tracks ADD COLUMN %s %s" % (col, decl))
 
@@ -1814,12 +1818,20 @@ def find_lyrics(row, query=None):
     for name, _, _ in jobs:
         results += got.get(name) or []
     dur = row["duration"] or 0
-    seen, out = set(), []
+    # the same song is often listed several times at different lengths: keep the
+    # one closest to this file's length, so its timings fit
+    best = {}
     for r in results:
         key = (r["source"], _norm_words(r["title"]), _norm_words(r["artist"]))
-        if key in seen:
-            continue
-        seen.add(key)
+        old = best.get(key)
+        if old is None:
+            best[key] = r
+        elif dur and r.get("duration") and r["synced"] and (
+                not old["synced"] or not old.get("duration")
+                or abs(r["duration"] - dur) < abs(old["duration"] - dur)):
+            best[key] = r
+    out = []
+    for r in best.values():
         sc = _sim(r["title"], title) * 2 + (_sim(r["artist"], artist) if artist else 0.5)
         if r["synced"]:
             sc += 0.3
@@ -1830,6 +1842,138 @@ def find_lyrics(row, query=None):
     out.sort(key=lambda r: -r["score"])
     return {"query": queries[0], "results": out[:10],
             "offline": bool(errors) and not results, "errors": errors[:4]}
+
+
+# --------------------------------------------------------------------------
+# auto lyrics — fill in songs that have no lyrics, only on a confident match
+# --------------------------------------------------------------------------
+
+LY = {"lock": threading.Lock(), "running": False, "cancel": False, "total": 0, "done": 0,
+      "found": 0, "current": "", "offline": False, "log": [], "retry_at": 0.0}
+LYRIC_EXTS = ("mp3", "m4a", "mp4", "aac", "flac", "ogg", "opus", "wav", "aif", "aiff")
+
+
+def _artist_ok(mine, theirs):
+    a, b = _norm_words(mine), _norm_words(theirs)
+    if not a or not b:
+        return False
+    if a == b or _sim(mine, theirs) >= 0.8:
+        return True
+    return (" %s " % a) in (" %s " % b)       # "Juice WRLD" inside "Juice WRLD & Young Thug"
+
+
+def pick_auto_lyrics(row):
+    """The lyrics to save for a song without any, or (None, why). Stricter than the
+    finder window, because nobody is looking: title and artist both have to match."""
+    title = clean_song_title(row["title"] or Path(row["filename"]).stem)
+    artist = (row["artist"] or "").split(",")[0].split(" & ")[0]
+    artist = re.split(r"\s+(?:feat|ft)\.?\s", artist, flags=re.I)[0].strip()
+    if not title or not artist:
+        return None, "needs a title and an artist"
+    res = find_lyrics(row)
+    if res.get("offline"):
+        return None, "offline"
+    dur = row["duration"] or 0
+    good = [r for r in res["results"] if _sim(r["title"], title) >= 0.9 and _artist_ok(artist, r["artist"])]
+    lr = [r for r in good if r["source"] == "lrclib" and (r.get("lyrics") or "").strip()]
+    # timings only fit when the recording is the same length; a leak or snippet of a
+    # different length still gets the words, just without timings
+    fits = [r for r in lr if r["synced"] and dur and r.get("duration") and abs(r["duration"] - dur) <= 2.5]
+    if fits:
+        r = min(fits, key=lambda r: abs(r["duration"] - dur))
+        return {"lyrics": r["lyrics"], "synced": [(x["t"], x["text"]) for x in r["synced"]],
+                "source": "LRCLIB", "title": r["title"], "artist": r["artist"]}, ""
+    if lr:
+        r = lr[0]
+        return {"lyrics": r["lyrics"], "synced": None, "source": "LRCLIB",
+                "title": r["title"], "artist": r["artist"]}, ""
+    for r in [r for r in good if r["source"] == "genius"][:2]:
+        try:
+            text = genius_lyrics(r["url"])
+        except Exception:
+            continue
+        if len(text) >= 40:
+            return {"lyrics": text, "synced": None, "source": "Genius",
+                    "title": r["title"], "artist": r["artist"]}, ""
+    return None, "no confident match"
+
+
+def auto_lyrics_one(row):
+    """Looks up and saves lyrics for one song. Returns 'found', 'none' or 'offline'."""
+    if (row["ext"] or "").lower() not in LYRIC_EXTS or not os.path.exists(row["path"]):
+        hit, why = None, "file type can't hold lyrics"
+    else:
+        try:
+            hit, why = pick_auto_lyrics(row)
+        except Exception:
+            hit, why = None, "offline"
+    if why == "offline":
+        return "offline"
+    conn = db()
+    try:
+        # don't overwrite lyrics that were added while this was looking
+        cur = conn.execute("SELECT COALESCE(lyrics,'') AS l FROM tracks WHERE id=?", (row["id"],)).fetchone()
+        if hit and cur and not cur["l"].strip():
+            try:
+                ok = write_lyrics(row["path"], hit["lyrics"], hit["synced"])
+            except Exception:
+                ok = False
+            if ok:
+                lf = read_lyrics_full(row["path"])
+                conn.execute("UPDATE tracks SET lyrics=?, has_synced=? WHERE id=?",
+                             (lf["plain"][:20000], 1 if lf["synced"] else 0, row["id"]))
+                _touch_file(conn, row["id"], row["path"])
+                with LY["lock"]:
+                    LY["log"].insert(0, {"id": row["id"], "title": row["title"] or row["filename"],
+                                         "artist": row["artist"] or "", "match": "%s — %s" % (hit["artist"], hit["title"]),
+                                         "source": hit["source"], "synced": bool(lf["synced"])})
+                    del LY["log"][300:]
+                    LY["found"] += 1
+            else:
+                hit = None
+        else:
+            hit = None
+        conn.execute("UPDATE tracks SET lyr_tried=? WHERE id=?", (time.time(), row["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return "found" if hit else "none"
+
+
+def _auto_lyrics_rows(retry, limit=None):
+    conn = db()
+    q = ("SELECT * FROM tracks WHERE missing=0 AND TRIM(COALESCE(lyrics,''))='' "
+         "AND TRIM(COALESCE(artist,''))<>''")
+    if not retry:
+        q += " AND lyr_tried IS NULL"
+    q += " ORDER BY id DESC"
+    if limit:
+        q += " LIMIT %d" % limit
+    rows = conn.execute(q).fetchall()
+    conn.close()
+    return rows
+
+
+def _run_auto_lyrics(rows):
+    fails = 0
+    try:
+        for r in rows:
+            if LY["cancel"]:
+                break
+            LY["current"] = r["title"] or r["filename"]
+            res = auto_lyrics_one(r)
+            if res == "offline":
+                fails += 1
+                if fails >= 3:           # no internet: stop instead of marking everything tried
+                    LY["offline"] = True
+                    break
+            else:
+                fails = 0
+            LY["done"] += 1
+            time.sleep(0.25)             # be polite to the lyric sites
+    finally:
+        LY["running"] = False
+        LY["current"] = ""
 
 
 # --------------------------------------------------------------------------
@@ -2844,6 +2988,17 @@ def background_worker(once=False):
                         c2.close()
                         BG["analysed"] += 1
                     continue
+            if (load_config().get("auto_lyrics", True) and not once and not LY["running"]
+                    and not SCAN_STATE["running"] and time.time() >= LY["retry_at"]):
+                todo = _auto_lyrics_rows(False, 3)
+                if todo:
+                    BG["busy"] = True
+                    for r in todo:
+                        if auto_lyrics_one(r) == "offline":
+                            LY["retry_at"] = time.time() + 600      # try again in ten minutes
+                            break
+                        time.sleep(0.25)
+                    continue
             BG["busy"] = False
             if once:
                 return
@@ -3523,7 +3678,7 @@ def _set_config(body):
                 "write_tags_to_file", "fingerprint", "watch_folders",
                 "discord", "discord_client_id", "discord_art_lookup", "discord_art_upload",
                 "autosync_model", "detect_bpm_key", "autosync_language", "autosync_precise",
-                "transcribe_model", "transcribe_lookup", "vocal_isolation", "native_window"):
+                "transcribe_model", "transcribe_lookup", "vocal_isolation", "native_window", "auto_lyrics"):
         if key in body:
             cfg[key] = body[key]
     if isinstance(body.get("defaults"), dict):
@@ -4391,6 +4546,60 @@ def api_lyrics_genius():
     if not text:
         return jsonify({"error": "That page has no lyrics yet."}), 404
     return jsonify({"lyrics": text})
+
+
+@app.post("/api/lyrics/auto")
+def api_lyrics_auto():
+    body = request.get_json(force=True) or {}
+    with LY["lock"]:
+        if LY["running"]:
+            return jsonify({"ok": True, "queued": LY["total"] - LY["done"]})
+        rows = _auto_lyrics_rows(bool(body.get("retry", True)))
+        if rows:
+            LY.update(running=True, cancel=False, total=len(rows), done=0, found=0, offline=False)
+            threading.Thread(target=_run_auto_lyrics, args=(rows,), daemon=True).start()
+    return jsonify({"ok": True, "queued": len(rows)})
+
+
+@app.get("/api/lyrics/auto/status")
+def api_lyrics_auto_status():
+    conn = db()
+    r = conn.execute("SELECT SUM(TRIM(COALESCE(lyrics,''))='') AS none, "
+                     "SUM(TRIM(COALESCE(lyrics,''))='' AND lyr_tried IS NULL AND TRIM(COALESCE(artist,''))<>'') AS waiting, "
+                     "SUM(TRIM(COALESCE(lyrics,''))='' AND TRIM(COALESCE(artist,''))='') AS noartist "
+                     "FROM tracks WHERE missing=0").fetchone()
+    conn.close()
+    return jsonify({"running": LY["running"], "total": LY["total"], "done": LY["done"], "found": LY["found"],
+                    "current": LY["current"], "offline": LY["offline"], "log": LY["log"][:100],
+                    "on": bool(load_config().get("auto_lyrics", True)),
+                    "none": r["none"] or 0, "waiting": r["waiting"] or 0, "noartist": r["noartist"] or 0})
+
+
+@app.post("/api/lyrics/auto/stop")
+def api_lyrics_auto_stop():
+    LY["cancel"] = True
+    return jsonify({"ok": True})
+
+
+@app.post("/api/lyrics/auto/undo")
+def api_lyrics_auto_undo():
+    """Takes back lyrics AURA added by itself (a wrong match)."""
+    tid = (request.get_json(force=True) or {}).get("id")
+    row = _track_row(tid) if isinstance(tid, int) else None
+    if not row or not os.path.exists(row["path"]):
+        return jsonify({"error": "That file is missing"}), 404
+    try:
+        write_lyrics(row["path"], "", None)
+    except Exception as exc:
+        return jsonify({"error": "Couldn't remove the lyrics: %s" % exc}), 500
+    conn = db()
+    conn.execute("UPDATE tracks SET lyrics='', has_synced=0, lyr_tried=? WHERE id=?", (time.time(), tid))
+    _touch_file(conn, tid, row["path"])
+    conn.commit()
+    conn.close()
+    with LY["lock"]:
+        LY["log"] = [x for x in LY["log"] if x["id"] != tid]
+    return jsonify({"ok": True})
 
 
 @app.get("/api/autosync/status")

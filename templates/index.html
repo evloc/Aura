@@ -1137,6 +1137,17 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <button class="btn quiet sm" id="btnCvStop" style="display:none">Stop</button></div>
           <div class="cvlist" id="cvList"></div>
           <p style="margin:10px 0 0;font-size:12px">To pick songs yourself: Organize → Library, search <code>notmp3</code>, tick the ones you want, then <b>Convert to MP3…</b></p></div>
+        <div class="card"><h3>Find lyrics by itself</h3>
+          <p>For songs with no lyrics, AURA looks them up online (LRCLIB, then Genius) and saves them into the file. It only saves a match
+            when both the title and the artist agree, so a song needs an artist tag. If the recording is the same length, the timings come too.</p>
+          <label class="chk2"><input type="checkbox" id="cfgAutoLy"><span>Do this by itself for new songs
+            <span style="color:var(--faint)">(in the background, each song is tried once)</span></span></label>
+          <div class="dstat" id="lyStat"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button class="btn sm" id="btnLyAll">Find lyrics for every song without them</button>
+            <button class="btn quiet sm" id="btnLyStop" style="display:none">Stop</button></div>
+          <div class="asjobs" id="lyLog"></div>
+          <p style="margin:10px 0 0;font-size:12px">Wrong song? Press <b>Remove</b> next to it. Unreleased songs often aren't online anywhere —
+            for those, use <b>Transcribe</b> in Now Playing.</p></div>
         <div class="card"><h3>Lyrics auto-sync</h3>
           <p>AURA listens to a song with a speech model on this PC and times your lyrics to the singing — works on unreleased songs and your own
             music too. Nothing is uploaded. The model downloads once, the first time you use it.</p>
@@ -1332,7 +1343,7 @@ function showView(v){
   if(v==='eras')renderEras();
   if(v==='missing')renderMissing();
   if(v==='stats')renderStats();
-  if(v==='settings'){levelNote();asRefresh();cvRefresh();bpmNote();appWindow();}
+  if(v==='settings'){levelNote();lyRefresh();asRefresh();cvRefresh();bpmNote();appWindow();}
 }
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showView(b.dataset.v));
 document.querySelectorAll('#sides button').forEach(b=>b.onclick=()=>showView(LASTV[b.dataset.side]));
@@ -3031,6 +3042,43 @@ $('#btnAsAll').onclick=async()=>{
   toast(r.queued?'Auto-syncing '+r.queued+' song'+(r.queued>1?'s':'')+' in the background':'Every song with lyrics already has timings',!r.queued);
   asRefresh();
 };
+/* ---------- lyrics found by itself ---------- */
+let LY_T=null,LY_WAS=false,LY_N=-1;
+async function lyRefresh(){
+  let r;try{r=await api('/api/lyrics/auto/status');}catch(e){return;}
+  $('#cfgAutoLy').checked=r.on;
+  $('#btnLyStop').style.display=r.running?'':'none';$('#btnLyAll').disabled=r.running;
+  $('#lyStat').textContent=r.running?'Looking… '+r.done+' of '+r.total+(r.current?' · '+r.current:'')+' · '+r.found+' found':
+    r.offline?"Couldn't reach the lyric sites — check your internet and try again.":
+    !r.none?'Every song has lyrics.':
+    r.none+' song'+(r.none>1?'s have':' has')+' no lyrics'+(r.waiting&&r.on?' · '+r.waiting+' still to look up (in the background)':'')+
+      (r.noartist?' · '+r.noartist+(r.noartist>1?' need':' needs')+' an artist tag first':'');
+  const box=$('#lyLog');box.innerHTML='';
+  r.log.forEach(x=>{
+    const d=el('div','','<span title="'+esc(x.match)+'">'+esc(x.title)+' <span style="color:var(--faint)">← '+esc(x.match)+' · '+esc(x.source)+(x.synced?' · timed':'')+'</span></span>');
+    const rm=el('span','rv','Remove');rm.onclick=async()=>{try{await post('/api/lyrics/auto/undo',{id:x.id});}catch(e){toast(e.message,true);return;}
+      lyChanged();lyRefresh();};
+    d.appendChild(rm);box.appendChild(d);});
+  if(r.found!==LY_N&&LY_N>=0&&r.log.length)lyChanged();
+  LY_N=r.log.length?r.found:LY_N<0?0:LY_N;
+  if(LY_WAS&&!r.running&&!r.offline)toast(r.found?'Found lyrics for '+r.found+' song'+(r.found>1?'s':''):'No new lyrics found online',!r.found);
+  LY_WAS=r.running;
+  clearTimeout(LY_T);
+  if(r.running||(r.on&&r.waiting&&$('#lyStat').offsetParent))LY_T=setTimeout(lyRefresh,r.running?1500:6000);
+}
+let LY_RL=null;
+function lyChanged(){ // the library changed underneath: reload quietly, and the open lyrics panel
+  clearTimeout(LY_RL);LY_RL=setTimeout(async()=>{try{await loadPlayer();}catch(e){}
+    const b=$('#npBody');if(b){b._lyrFor=null;try{renderNP();}catch(e){}}},800);
+}
+async function lyStart(){
+  let r;try{r=await post('/api/lyrics/auto',{retry:true});}catch(e){toast(e.message,true);return;}
+  if(!r.queued)toast('No songs to look up — songs without lyrics need an artist tag first',true);
+  LY_WAS=!!r.queued;lyRefresh();
+}
+$('#btnLyAll').onclick=lyStart;
+$('#btnLyStop').onclick=async()=>{await post('/api/lyrics/auto/stop',{});lyRefresh();};
+$('#cfgAutoLy').onchange=async e=>{await saveCfg({auto_lyrics:e.target.checked});lyRefresh();};
 $('#btnAsStop').onclick=async()=>{await post('/api/autosync/cancel',{});asRefresh();};
 
 /* tap-to-sync: play the song and tap as each line starts */
@@ -3536,7 +3584,7 @@ $('#bCover').onclick=()=>coverFinder([...SEL]);
 /* ---------- missing info ---------- */
 const MI_ACT={
   noart:[['Find covers','cover']],noartist:[['Auto-tag','auto']],notitle:[['Auto-tag','auto']],noalbum:[['Auto-tag','auto']],
-  noera:[['Auto-tag from folders','autoera']],nolyrics:[],nosync:[['Auto-sync all','sync']],unrated:[],notmp3:[['Convert','convert']],noyear:[]};
+  noera:[['Auto-tag from folders','autoera']],nolyrics:[['Find lyrics online','lyrics']],nosync:[['Auto-sync all','sync']],unrated:[],notmp3:[['Convert','convert']],noyear:[]};
 const MI_HELP={noart:'Cover art inside the file',noartist:'Artist tag',notitle:'A title in the tags (not just the filename)',
   noalbum:'Album tag',noyear:'Year tag',noera:'Era or session',nolyrics:'Any lyrics',nosync:'Lyrics with timings',unrated:'Star rating',notmp3:'Will play everywhere'};
 async function renderMissing(){
@@ -3561,6 +3609,7 @@ async function miIds(key){const r=await api('/api/tracks?q='+encodeURIComponent(
 async function miAct(a,key){
   if(a==='convert'){showView('settings');convertDialog(null);return;}
   if(a==='sync'){$('#btnAsAll').click();return;}
+  if(a==='lyrics'){showView('settings');lyStart();return;}
   const ids=await miIds(key);
   if(a==='cover'){coverFinder(ids.slice(0,1),null,ids);return;}
   if(a==='autoera'){$('#afFolder').value='era';}

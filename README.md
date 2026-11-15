@@ -254,6 +254,25 @@ returns. Media keys and the Windows media controls work too.
 
 ---
 
+## Lyrics found by themselves
+
+For songs with no lyrics, AURA looks them up online (LRCLIB first, then
+Genius) and saves them into the file. New songs are looked up in the
+background, once each. To go through the whole library now, press **Find
+lyrics for every song without them** in Settings → Find lyrics by itself, or
+**Find lyrics online** on the No lyrics card in Organize → Missing info.
+
+- A match is only saved when the title and the artist both agree, so a song
+  needs an artist tag. Things like `(prod. …)` and `[v2]` in the title are
+  ignored when matching.
+- If the online version is the same length as your file, the line timings are
+  saved too. If the length differs (a leak, a snippet), only the words are
+  saved; use **Auto-sync** to time them.
+- Every song it filled in is listed in Settings with a **Remove** button, in
+  case a match is wrong.
+- Unreleased songs often aren't online anywhere. For those, use **Transcribe**.
+- Turn the background lookup off with *Do this by itself for new songs*.
+
 ## Looks
 
 Everything here is in **Settings → Player**.
