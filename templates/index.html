@@ -650,6 +650,28 @@ input[type=range]{accent-color:var(--accent);height:4px}
 .kara[data-scene="ocean"] .kneb{opacity:.3}
 .kara[data-scene="glow"] .kneb{opacity:.75;filter:blur(110px)}
 .kara[data-scene="city"] .kart{border-radius:14px}
+/* lighter on the PC: the glows are soft gradients already, so no blur passes */
+.kara .kneb,.kara[data-scene="glow"] .kneb{filter:none;mix-blend-mode:normal}
+.kara .kneb.n1{background:radial-gradient(circle,color-mix(in srgb,var(--k1) 62%,transparent),transparent 68%)}
+.kara .kneb.n2{background:radial-gradient(circle,color-mix(in srgb,var(--k2) 62%,transparent),transparent 68%)}
+.kara .kneb.n3{background:radial-gradient(circle,color-mix(in srgb,var(--k1) 62%,transparent),transparent 70%)}
+.kara .kl,.kara .kl.near{filter:none}
+.kara .kneb.n1,.kara .kneb.n2,.kara .kneb.n3{animation:none;will-change:auto}
+.kara .kring,.kara .kart{will-change:transform}
+.kara.paused .kneb,.kara.paused .kring,.kara.paused .kart{animation-play-state:paused}
+.npside{background:color-mix(in srgb,var(--surface) 74%,transparent);backdrop-filter:none;-webkit-backdrop-filter:none}
+.nptop .btn.quiet,.lyrbar .btn{backdrop-filter:none}
+.kara .kart{box-shadow:0 0 60px 4px color-mix(in srgb,var(--k1) 55%,transparent),0 30px 80px #000c}
+.kara .korbit::before{content:"";position:absolute;inset:-14%;border-radius:50%;pointer-events:none;will-change:opacity;
+  background:radial-gradient(circle,color-mix(in srgb,var(--k1) 60%,transparent) 30%,transparent 68%);opacity:calc(.15 + .85*var(--kp))}
+/* "Use less CPU" */
+.lite *,.lite *::before,.lite *::after{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.lite .kara .kneb,.lite .kara .kring,.lite .kara .kart{animation:none}
+.lite .kara .kl.cur.byw{filter:none}
+.lite .kara .kcol,.lite .kara .kl{transition-duration:.25s}
+.lite .npbg .lay{filter:none;background-image:none!important;background:radial-gradient(ellipse at 30% 20%,color-mix(in srgb,var(--accent) 55%,transparent),transparent 70%)}
+.lite .ha:has(img:not(.ld)),.lite .npart:has(img:not(.ld)),.lite .qa:has(img:not(.ld)),.lite .kart:has(img:not(.ld)){animation:none;background-image:none}
+.lite .npart,.lite .np.paused .npart{transition:none;box-shadow:0 20px 60px #0008}
 /* compare versions */
 .cmp .sides{display:flex;gap:14px;padding:18px 20px}
 .cmp .side{flex:1;border:2px solid var(--hair);border-radius:14px;padding:14px;cursor:pointer;display:flex;gap:12px;align-items:center;min-width:0}
@@ -1106,6 +1128,8 @@ kbd{background:var(--surface2);border-radius:5px;padding:2px 7px;font-size:11.5p
             <div class="swrow" id="accRow"></div></div>
           <div class="srow2"><span>Full-screen lyrics scene</span><select class="sel" id="setScene">
             <option value="space">Space</option><option value="ocean">Ocean</option><option value="city">Neon city</option><option value="glow">Glow</option></select></div>
+          <label class="chk2"><input type="checkbox" id="setLite"><span>Use less CPU — no blur, and still backgrounds in full-screen lyrics
+            <span style="color:var(--faint)">(turn on if AURA makes your PC's fan spin up)</span></span></label>
           <label class="chk2"><input type="checkbox" id="setCompact"><span>Compact song list — smaller rows, more songs on screen</span></label>
           <div class="srow2"><span>Between songs</span><select class="sel" id="setXf">
             <option value="0">No gap (gapless)</option><option value="2">Crossfade 2 seconds</option>
@@ -2525,7 +2549,7 @@ async function loadState(){
   XF=+(pref.xf||0);GROUPV=pref.groupv!==false;NP_SIDE=pref.npside||'lyrics';
   LEVEL=pref.level!==false;SPEED=+(pref.speed||1);EQ=Object.assign({preset:'flat',gains:[0,0,0,0,0]},pref.eq||{});
   applySpeed();applyEq();renderEqUI();
-  setVol(pref.vol===undefined?90:pref.vol);updateModes();applyTheme(pref.theme||'dark');applyCompact(!!pref.compact);syncPlayerSettings();
+  setVol(pref.vol===undefined?90:pref.vol);updateModes();applyTheme(pref.theme||'dark');applyCompact(!!pref.compact);applyLite();syncPlayerSettings();
 }
 function restoreQueue(){
   const s=STATE0;if(!s||!Array.isArray(s.queue)||!s.queue.length)return;
@@ -2550,7 +2574,7 @@ function npBackdrop(bg){
   [...box.querySelectorAll('.lay')].slice(0,-1).forEach(o=>{o.classList.remove('on');setTimeout(()=>o.remove(),1200);});
 }
 function updatePlayBtn(){
-  $('#np').classList.toggle('paused',audio.paused);
+  $('#np').classList.toggle('paused',audio.paused);{const k=document.querySelector('.kara');if(k)k.classList.toggle('paused',audio.paused);}
   const ic=audio.paused||!audio.getAttribute('src')?I.play:I.pause;
   $('#pPlay').innerHTML=ic;$('#npPlay').innerHTML=ic;
   if(PIP){const b=PIP.document.querySelector('#mPlay');if(b)b.innerHTML=ic;}
@@ -2809,9 +2833,9 @@ function paintWords(line,cur,nextT){
   }
 }
 function clearWords(S){if(S)S.forEach(w=>{if(w._p!==undefined){w._p=undefined;w.style.removeProperty('--p');}});}
-let WORD_RAF=0;
+let WORD_RAF=0,WORD_TO=0;
 function wordLoop(){
-  cancelAnimationFrame(WORD_RAF);
+  cancelAnimationFrame(WORD_RAF);clearTimeout(WORD_TO);
   const step=()=>{
     const cur=smoothTime();let alive=false;
     const S=LYRSYNC;
@@ -2819,7 +2843,9 @@ function wordLoop(){
       alive=true;const L=S.lines[S.idx];if(L&&L.words)paintWords(L,cur,S.lines[S.idx+1]&&S.lines[S.idx+1].t);
     }
     if(KARA){alive=true;if(KARA.cur&&KARA.cur.words)paintWords(KARA.cur,cur,KARA.nextT);}
-    if(alive)WORD_RAF=requestAnimationFrame(step);
+    if(!alive)return;
+    if(audio.paused||document.hidden)WORD_TO=setTimeout(()=>{WORD_RAF=requestAnimationFrame(step);},300);
+    else WORD_RAF=requestAnimationFrame(step);
   };
   WORD_RAF=requestAnimationFrame(step);
 }
@@ -3327,7 +3353,7 @@ function lookUI(){
   }
   if(ar){ar.querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.c||null)===(pref.accent||null)));
     if(pref.accent)$('#accPick').value=pref.accent;}
-  $('#setCoverCol').checked=pref.coverColors!==false;$('#setScene').value=pref.scene||'space';$('#setCompact').checked=!!pref.compact;
+  $('#setCoverCol').checked=pref.coverColors!==false;$('#setScene').value=pref.scene||'space';$('#setCompact').checked=!!pref.compact;$('#setLite').checked=!!pref.lite;
 }
 function syncPlayerSettings(){
   lookUI();
@@ -3337,6 +3363,8 @@ $('#setTheme').onchange=e=>{applyTheme(e.target.value);savePref();};
 $('#setCoverCol').onchange=e=>{pref.coverColors=e.target.checked;savePref();songColors();};
 $('#setScene').onchange=e=>{pref.scene=e.target.value;savePref();};
 $('#setCompact').onchange=e=>{applyCompact(e.target.checked);savePref();};
+function applyLite(){document.documentElement.classList.toggle('lite',!!pref.lite);}
+$('#setLite').onchange=e=>{pref.lite=e.target.checked;applyLite();savePref();};
 $('#songsCompact').onclick=()=>{applyCompact(!pref.compact);savePref();};
 $('#setXf').onchange=e=>{XF=+e.target.value;pref.xf=XF;savePref();
   toast(XF?'Songs will crossfade over '+XF+' seconds':'Songs will follow each other with no gap');};
@@ -3885,7 +3913,7 @@ function bassEnergy(){
   let e=0;const an=GRAPH&&GRAPH.an;
   if(an&&!audio.paused){if(!BASS.buf)BASS.buf=new Uint8Array(an.frequencyBinCount);an.getByteFrequencyData(BASS.buf);for(let i=1;i<7;i++)e+=BASS.buf[i];e=e/(6*255);}
   BASS.e+=(e-BASS.e)*(e>BASS.e?0.35:0.08);
-  const w=$('#kara');if(w)w.style.setProperty('--kp',BASS.e.toFixed(3));
+  const w=document.querySelector('#kara .korbit');const v=BASS.e.toFixed(2);if(w&&w._kp!==v){w._kp=v;w.style.setProperty('--kp',v);}
   return BASS.e;
 }
 const SCENE_NAMES={space:'Space',ocean:'Ocean',city:'Neon city',glow:'Glow'};
@@ -3898,20 +3926,28 @@ function karaScene(name){
   ({space:karaStars,ocean:sceneOcean,city:sceneCity,glow:sceneGlow})[name](cv,KARA.sceneRun);
   const b=$('#kScene');if(b)b.textContent=SCENE_NAMES[name];
 }
+/* scenes draw at 30 frames a second while music plays, slowly when paused, and stand still with "Use less CPU" */
+function sceneNext(frame){
+  if(pref.lite)setTimeout(()=>requestAnimationFrame(frame),1500);
+  else if(audio.paused||document.hidden)setTimeout(()=>requestAnimationFrame(frame),350);
+  else requestAnimationFrame(frame);
+}
+const sceneSkip=(now,last)=>!pref.lite&&!audio.paused&&now-last<28;
 /* shared plumbing for the drawn scenes */
 function sceneLoop(cv,run,draw){
   const ctx=cv.getContext('2d');const S={W:0,H:0,dpr:1,t:0};
-  const size=()=>{S.dpr=Math.min(2,window.devicePixelRatio||1);const r=cv.getBoundingClientRect();S.W=cv.width=Math.max(2,Math.round(r.width*S.dpr));S.H=cv.height=Math.max(2,Math.round(r.height*S.dpr));};
+  const size=()=>{S.dpr=Math.min(pref.lite?1:1.25,window.devicePixelRatio||1);const r=cv.getBoundingClientRect();S.W=cv.width=Math.max(2,Math.round(r.width*S.dpr));S.H=cv.height=Math.max(2,Math.round(r.height*S.dpr));};
   size();window.addEventListener('resize',size);
   const still=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   let last=performance.now();
   const frame=now=>{
     if(!KARA||KARA.sceneRun!==run||!document.body.contains(cv)){window.removeEventListener('resize',size);return;}
-    const dt=Math.min(0.05,(now-last)/1000);last=now;
-    const e=bassEnergy();S.t+=dt*(still?0.25:1);
+    if(sceneSkip(now,last)){requestAnimationFrame(frame);return;}
+    const dt=pref.lite?0:Math.min(0.05,(now-last)/1000);last=now;
+    const e=pref.lite?0:bassEnergy();S.t+=dt*(still?0.25:1);
     ctx.clearRect(0,0,S.W,S.H);
     draw(ctx,S,dt,e,KARA.k1||[106,92,255],KARA.k2||[22,136,255],audio.paused||still);
-    requestAnimationFrame(frame);
+    sceneNext(frame);
   };
   requestAnimationFrame(frame);
 }
@@ -4005,12 +4041,13 @@ function karaStars(cv,run){
   for(let i=0;i<N;i++)stars.push(seed({}));
   let shoot=null,last=performance.now(),energy=0,buf=null;
   const still=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const size=()=>{dpr=Math.min(2,window.devicePixelRatio||1);const r=cv.getBoundingClientRect();W=cv.width=Math.max(2,Math.round(r.width*dpr));H=cv.height=Math.max(2,Math.round(r.height*dpr));};
+  const size=()=>{dpr=Math.min(pref.lite?1:1.25,window.devicePixelRatio||1);const r=cv.getBoundingClientRect();W=cv.width=Math.max(2,Math.round(r.width*dpr));H=cv.height=Math.max(2,Math.round(r.height*dpr));};
   size();window.addEventListener('resize',size);
   const frame=now=>{
     if(!KARA||KARA.sceneRun!==run||!document.body.contains(cv)){window.removeEventListener('resize',size);return;}
-    const dt=Math.min(0.05,(now-last)/1000);last=now;
-    energy=bassEnergy();
+    if(sceneSkip(now,last)){requestAnimationFrame(frame);return;}
+    const dt=pref.lite?0:Math.min(0.05,(now-last)/1000);last=now;
+    energy=pref.lite?0:bassEnergy();
     const speed=still?0.012:(audio.paused?0.012:0.035+energy*0.22);
     ctx.clearRect(0,0,W,H);
     const cx=W/2,cy=H/2,f=Math.max(W,H)*0.55;
@@ -4037,7 +4074,7 @@ function karaStars(cv,run){
       ctx.globalAlpha=1;ctx.strokeStyle=g;ctx.lineWidth=2*dpr;ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-shoot.vx*170*dpr,y2-76*dpr);ctx.stroke();
       if(shoot.t>0.7)shoot=null;}
     ctx.globalAlpha=1;
-    requestAnimationFrame(frame);
+    sceneNext(frame);
   };
   requestAnimationFrame(frame);
 }
@@ -4804,6 +4841,7 @@ $('#btnQuit').onclick=async()=>{
   setTimeout(()=>window.close(),400);
 };
 document.addEventListener('load',e=>{if(e.target&&e.target.tagName==='IMG')e.target.classList.add('ld');},true);
+document.addEventListener('error',e=>{if(e.target&&e.target.tagName==='IMG')e.target.classList.add('ld');},true);
 document.addEventListener('error',e=>{if(e.target&&e.target.tagName==='IMG')e.target.classList.add('ld');},true);
 const WID=Math.random().toString(36).slice(2)+Date.now().toString(36);
 setInterval(()=>{post('/api/ping',{w:WID}).catch(()=>{});},20000);

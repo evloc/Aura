@@ -2930,6 +2930,12 @@ def analyse_bpm_key(row):
 def background_worker(once=False):
     """Fills in what scans leave for later: a one-time lyrics index for libraries
     from before lyrics search existed, then volume levels for new or changed songs."""
+    if os.name == "nt" and not once:
+        try:    # Windows "background mode": this thread only gets CPU and disk nobody else wants
+            import ctypes
+            ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), 0x00010000)
+        except Exception:
+            pass
     while True:
         try:
             conn = db()
@@ -2960,6 +2966,8 @@ def background_worker(once=False):
                     c2.commit()
                     c2.close()
                     BG["levelled"] += 1
+                    if not once:
+                        time.sleep(0.4)          # leave room for the player between songs
                 continue
             if load_config().get("detect_bpm_key", True) and not SCAN_STATE["running"] and not CONV["running"]:
                 c3 = db()
@@ -2987,6 +2995,8 @@ def background_worker(once=False):
                         c2.commit()
                         c2.close()
                         BG["analysed"] += 1
+                        if not once:
+                            time.sleep(1.0)
                     continue
             if (load_config().get("auto_lyrics", True) and not once and not LY["running"]
                     and not SCAN_STATE["running"] and time.time() >= LY["retry_at"]):

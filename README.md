@@ -290,6 +290,12 @@ Everything here is in **Settings → Player**.
   in Settings or press the scene button in full-screen lyrics to switch. They
   move with the bass of the song.
 - **Compact song list.** Smaller rows, so more songs fit on screen.
+- **Use less CPU.** Turns off blur and keeps the full-screen lyric backgrounds
+  still. Turn it on if AURA makes the PC's fan spin up.
+
+Even with that off, AURA goes easy on the PC: moving backgrounds slow right
+down while a song is paused, and background jobs (volume levels, BPM and key,
+lyrics lookups) run at Windows' lowest priority with pauses between songs.
 
 ## Sharing AURA and updating it
 
